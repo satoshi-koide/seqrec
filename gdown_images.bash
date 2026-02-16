@@ -6,6 +6,7 @@ DOWNLOAD_DIR="dataset_archive"
 # Main process as function
 download_and_extract() {
     local GDRIVE_FOLDER_ID="$1"
+    local DOWNLOAD_DIR="$2"
     
     if [ -z "$GDRIVE_FOLDER_ID" ]; then
         echo "Error: Please specify Google Drive folder ID."
@@ -33,6 +34,7 @@ download_and_extract() {
 
     # 3. Extract archives
     echo "Starting extraction process..."
+    cwd=$(pwd)
     cd $DOWNLOAD_DIR
 
     find . -maxdepth 1 -name "*.part00" | while read filename; do
@@ -50,11 +52,13 @@ download_and_extract() {
         fi
     done
 
+    mv $category images
+    cd $cwd
     echo "All processes completed."
 }
 
 # Call function (pass command line argument)
 
-download_and_extract 1xdm8cmN9A_6dNxY5d2HRPQnykLcSBZT6
-download_and_extract 1hBCx7zpQXo4MG_uDjOByTWs8VokH0rHD
-download_and_extract 1o8CTIuAqEtn3UtpTNLKrRGJtQ-PIqp1G
+download_and_extract 1xdm8cmN9A_6dNxY5d2HRPQnykLcSBZT6 dataset/toys
+download_and_extract 1hBCx7zpQXo4MG_uDjOByTWs8VokH0rHD dataset/sports
+download_and_extract 1o8CTIuAqEtn3UtpTNLKrRGJtQ-PIqp1G dataset/beauty
