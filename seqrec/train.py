@@ -106,7 +106,7 @@ def main(dataset_path: str = "dataset/toys"):
         output_dir="./output_sasrec",
         
         # 学習設定
-        num_train_epochs=30,
+        num_train_epochs=20,
         per_device_train_batch_size=128,
         per_device_eval_batch_size=128, # 注意: メモリ圧迫する場合は下げる
         learning_rate=1e-3,
@@ -141,6 +141,10 @@ def main(dataset_path: str = "dataset/toys"):
     )
 
     trainer.train()
+
+    # 3. ベストモデルでテスト評価
+    test_metrics = trainer.evaluate(datasets["test"])
+    print("Test Metrics:", test_metrics)
     
 if __name__ == "__main__":
-    main()
+    main("dataset/beauty")
