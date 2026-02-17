@@ -1,29 +1,78 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from transformers import PretrainedConfig, PreTrainedModel
 
 # ==========================================
-# 1. 補助モジュール (変更なし)
+# 1. Configuration Class
+# ==========================================
+class SASRecConfig(PretrainedConfig):
+    model_type = "sasrec"
+
+    def __init__(
+        self,
+        num_items=50000,
+        max_len=50,
+        hidden_units=64,
+        num_blocks=2,
+        num_heads=2,
+        dropout_rate=0.2,
+        use_rating=False,
+        image_feature_dim=0,
+        text_feature_dim=0,
+        pad_token_id=0,
+        **kwargs
+    ):
+        """
+        Args:
+            num_items (int): Vocabulary size (items + padding).
+            max_len (int): Maximum sequence length.
+            hidden_units (int): Embedding dimension.
+            num_blocks (int): Number of Transformer blocks.
+            num_heads (int): Number of Attention heads.
+            dropout_rate (float): Dropout probability.
+            use_rating (bool): Whether to use rating embeddings.
+            image_feature_dim (int): Dimension of input image features (0 to disable).
+            text_feature_dim (int): Dimension of input text features (0 to disable).
+            pad_token_id (int): ID used for padding.
+        """
+        self.num_items = num_items
+        self.max_len = max_len
+        self.hidden_units = hidden_units
+        self.num_blocks = num_blocks
+        self.num_heads = num_heads
+        self.dropout_rate = dropout_rate
+        self.use_rating = use_rating
+        self.image_feature_dim = image_feature_dim
+        self.text_feature_dim = text_feature_dim
+        super().__init__(pad_token_id=pad_token_id, **kwargs)
+
+
+# ==========================================
+# 2. Helper Modules (Layers)
 # ==========================================
 class PointWiseFeedForward(nn.Module):
     def __init__(self, hidden_units, dropout_rate):
-        super(PointWiseFeedForward, self).__init__()
+        super().__init__()
         self.linear1 = nn.Linear(hidden_units, hidden_units)
         self.dropout1 = nn.Dropout(dropout_rate)
-        self.activation = nn.ReLU()
+        self.activation = nn.ReLU() # GELU is also an option
         self.linear2 = nn.Linear(hidden_units, hidden_units)
         self.dropout2 = nn.Dropout(dropout_rate)
 
     def forward(self, inputs):
+        # inputs: (Batch, SeqLen, Hidden)
         output = self.dropout1(self.activation(self.linear1(inputs)))
         output = self.dropout2(self.linear2(output))
-        return output + inputs
+        return output + inputs # Residual Connection
 
-class SASRecBlock(nn.Module):
+
+class SASRecLayer(nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
-        super(SASRecBlock, self).__init__()
+        super().__init__()
         self.ln1 = nn.LayerNorm(hidden_units)
         self.ln2 = nn.LayerNorm(hidden_units)
+        
+        # batch_first=True corresponds to (Batch, Seq, Feature)
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden_units, 
             num_heads=num_heads, 
@@ -34,70 +83,73 @@ class SASRecBlock(nn.Module):
         self.ffn = PointWiseFeedForward(hidden_units, dropout_rate)
 
     def forward(self, inputs, attn_mask):
+        # 1. LayerNorm before Attention (Pre-Norm style is more stable, 
+        #    but Original SASRec uses Post-Norm. Here we use Post-Norm structure)
+        
+        # Self-Attention
+        # query=inputs, key=inputs, value=inputs
         attn_output, _ = self.mha(
-            query=inputs, key=inputs, value=inputs, attn_mask=attn_mask
+            query=inputs, 
+            key=inputs, 
+            value=inputs, 
+            attn_mask=attn_mask
         )
+        # Residual + Norm
         output = self.ln1(inputs + self.mha_dropout(attn_output))
+        
+        # Feed Forward + Residual + Norm
         output = self.ln2(self.ffn(output))
+        
         return output
 
-# ==========================================
-# 2. 本体クラス (Trainer対応版)
-# ==========================================
-class SASRec(nn.Module):
-    def __init__(self, config):
-        """
-        config (dict): {
-            "num_items": int,
-            "max_len": int,
-            "hidden_units": int,
-            "num_blocks": int,
-            "num_heads": int,
-            "dropout_rate": float,
-            "use_rating": bool,
-            "image_feature_dim": int,
-            "text_feature_dim": int
-        }
-        """
-        super().__init__()
-        self.config = config # Trainerが参照する場合があるため保持
-        
-        self.num_items = config['num_items']
-        self.hidden_units = config['hidden_units']
-        self.max_len = config['max_len']
 
-        # --- Embedding Layers ---
+# ==========================================
+# 3. Main Model (PretrainedModel)
+# ==========================================
+class SASRec(PreTrainedModel):
+    config_class = SASRecConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_items = config.num_items
+        self.hidden_units = config.hidden_units
+        self.max_len = config.max_len
+
+        # --- Embeddings ---
         self.item_emb = nn.Embedding(self.num_items, self.hidden_units, padding_idx=0)
         self.pos_emb = nn.Embedding(self.max_len, self.hidden_units)
-        self.emb_dropout = nn.Dropout(config['dropout_rate'])
+        self.emb_dropout = nn.Dropout(config.dropout_rate)
 
-        # Side Information
-        if config.get('use_rating', False):
+        # --- Side Information ---
+        if config.use_rating:
+            # 1-5 stars + 0 padding = 6
             self.rating_emb = nn.Embedding(6, self.hidden_units, padding_idx=0)
         
-        if config.get('image_feature_dim', 0) > 0:
-            self.img_proj = nn.Linear(config['image_feature_dim'], self.hidden_units)
+        if config.image_feature_dim > 0:
+            self.img_proj = nn.Linear(config.image_feature_dim, self.hidden_units)
         
-        if config.get('text_feature_dim', 0) > 0:
-            self.text_proj = nn.Linear(config['text_feature_dim'], self.hidden_units)
+        if config.text_feature_dim > 0:
+            self.text_proj = nn.Linear(config.text_feature_dim, self.hidden_units)
 
         # --- Transformer Blocks ---
         self.blocks = nn.ModuleList([
-            SASRecBlock(
+            SASRecLayer(
                 self.hidden_units, 
-                config['num_heads'], 
-                config['dropout_rate']
-            ) for _ in range(config['num_blocks'])
+                config.num_heads, 
+                config.dropout_rate
+            ) for _ in range(config.num_blocks)
         ])
+        
+        self.last_layernorm = nn.LayerNorm(self.hidden_units)
 
         # --- Loss Function ---
-        # Trainer内でLoss計算を完結させるために保持
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-        # 初期化
-        self.apply(self._init_weights)
+        # Initialize weights
+        self.post_init()
 
     def _init_weights(self, module):
+        """ Initialize the weights (Automated by PretrainedModel) """
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.xavier_normal_(module.weight)
         elif isinstance(module, nn.LayerNorm):
@@ -106,54 +158,100 @@ class SASRec(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def forward(self, input_ids, labels=None, image_feats=None, text_feats=None, input_ratings=None, **kwargs):
+    def forward(
+        self, 
+        input_ids, 
+        labels=None, 
+        image_feats=None, 
+        text_feats=None, 
+        input_ratings=None, 
+        **kwargs
+    ):
         """
         Args:
-            input_ids: (Batch, SeqLen)
-            labels: (Batch) - Trainerから渡される正解ラベル (Optional)
-            image_feats, text_feats, input_ratings: (Optional) Side Info
-        Returns:
-            dict: { "loss": loss_val, "logits": logits_tensor }
+            input_ids: (Batch, SeqLen) - Item history
+            labels: (Batch, SeqLen) - Target items (Next item at each position)
+            image_feats: (Batch, SeqLen, ImgDim) - Optional
+            text_feats: (Batch, SeqLen, TxtDim) - Optional
+            input_ratings: (Batch, SeqLen) - Optional
         """
         device = input_ids.device
-        batch_size, seq_len = input_ids.shape
+        seq_len = input_ids.shape[1]
 
         # 1. Embedding
         seqs = self.item_emb(input_ids)
         positions = torch.arange(seq_len, device=device).unsqueeze(0)
         seqs += self.pos_emb(positions)
 
-        # Side Information Integration
+        # Side Information Integration (Add)
         if input_ratings is not None and hasattr(self, 'rating_emb'):
             seqs += self.rating_emb(input_ratings)
         if image_feats is not None and hasattr(self, 'img_proj'):
+            # Projection: (B, L, ImgDim) -> (B, L, Hidden)
             seqs += self.img_proj(image_feats)
         if text_feats is not None and hasattr(self, 'text_proj'):
             seqs += self.text_proj(text_feats)
 
         seqs = self.emb_dropout(seqs)
 
-        # 2. Mask Creation (Causal Mask)
-        # 未来を見ないマスク
-        attn_mask = torch.triu(torch.ones(seq_len, seq_len, device=device) * float('-inf'), diagonal=1)
+        # 2. Causal Masking (Look-ahead mask)
+        # (SeqLen, SeqLen) - Upper triangular is -inf
+        attn_mask = torch.triu(
+            torch.ones((seq_len, seq_len), device=device) * float('-inf'), 
+            diagonal=1
+        )
 
-        # 3. Transformer Forward
+        # 3. Transformer Encoder
+        # Pass through all blocks
         for block in self.blocks:
             seqs = block(seqs, attn_mask)
+        
+        seqs = self.last_layernorm(seqs)
 
         # 4. Prediction Head
-        # 系列の最後のステップのみを使用 (Many-to-One)
-        last_hidden = seqs[:, -1, :] # (Batch, Hidden)
-        
-        # アイテム埋め込み行列との内積で全アイテムのスコアを計算
-        logits = torch.matmul(last_hidden, self.item_emb.weight.transpose(0, 1)) # (Batch, NumItems)
+        # Many-to-Many: Compute logits for ALL positions
+        # Weight tying: Use item embedding weight as output layer
+        # (Batch, SeqLen, Hidden) @ (NumItems, Hidden)^T -> (Batch, SeqLen, NumItems)
+        logits = torch.matmul(seqs, self.item_emb.weight.transpose(0, 1))
 
-        # 5. Output Construction
-        outputs = {"logits": logits}
-
-        # labels が渡された場合は Loss を計算して辞書に含める
+        loss = None
         if labels is not None:
-            loss = self.criterion(logits, labels)
-            outputs["loss"] = loss
+            # Shiftさせて予測する場合と、Dataset側ですでにズレている場合がある
+            # 今回のDataset実装は「InputとLabelsがズレている」のでそのまま計算
+            loss = self.criterion(logits.view(-1, self.num_items), labels.view(-1))
 
-        return outputs
+        return {
+            "loss": loss,
+            "logits": logits
+        }
+
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=1):
+        """
+        推論用 (Autoregressive Generation)
+        Semantic IDの場合は max_new_tokens > 1 になる
+        """
+        self.eval()
+        
+        # 現在の系列のコピーを作成
+        generated = input_ids.clone()
+        
+        for _ in range(max_new_tokens):
+            # forwardを呼ぶ
+            outputs = self.forward(generated)
+            logits = outputs["logits"]
+            
+            # 最後のステップのロジットを取得
+            next_token_logits = logits[:, -1, :]
+            
+            # Greedy Decoding (一番確率が高いものを選ぶ)
+            # ※ 必要ならここで Sampling や Beam Search を実装する
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # 生成されたトークンを系列に追加
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Semantic IDの場合、ここで「アイテム終端トークン」が出たら打ち切る等の処理が入る
+        
+        # 入力部分を除いた「生成された部分」だけ返す
+        return generated[:, input_ids.shape[1]:]
