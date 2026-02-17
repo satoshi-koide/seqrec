@@ -1,15 +1,30 @@
+import os
+import ast
+import gzip
 import json
-import torch
 import numpy as np
+from PIL import Image
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+
+import torch
 from torch.utils.data import Dataset, DataLoader
+
+class DataMap:
+    def __init__(self, data_path):
+        with open(f'{data_path}/datamaps.json', 'r') as f:
+            self.datamaps = json.load(f)
+        
+        print(f"DataMap keys: {list(self.datamaps.keys())}")
+        
+        self.item2id = {k: int(v) for k, v in self.datamaps['item2id'].items()}
+        self.id2item = {int(v): k for k, v in self.item2id.items()}
 
 class SequentialRecDataset(Dataset):
     def __init__(self, 
                  user_seqs, 
                  targets=None, 
                  max_len=50, 
-                 image_features=None, 
-                 text_features=None, 
                  pad_token=0):
         """
         Args:
@@ -17,18 +32,12 @@ class SequentialRecDataset(Dataset):
             targets (list, optional): Eval/Test用の正解アイテムIDリスト。
                                       Noneの場合はTrainモード（Many-to-Many学習）として動作する。
             max_len (int): 系列最大長
-            image_features (torch.Tensor, optional): アイテムIDに対応する画像特徴量
-            text_features (torch.Tensor, optional): アイテムIDに対応するテキスト特徴量
             pad_token (int): パディングに使用するID (Loss計算時に無視されるIDと同じである必要がある)
         """
         self.user_seqs = user_seqs
         self.targets = targets
         self.max_len = max_len
         self.pad_token = pad_token
-        
-        # 特徴量はメモリ効率のため参照として保持
-        self.image_features = image_features
-        self.text_features = text_features
 
     def __len__(self):
         return len(self.user_seqs)
@@ -96,17 +105,7 @@ class SequentialRecDataset(Dataset):
             "labels": labels  # Trainerが自動的にLoss計算に使用
         }
 
-        # 画像特徴量 (入力系列に対応するもの)
-        if self.image_features is not None:
-            # パディング(0)の部分は、特徴量テーブルの0番目(ゼロベクトル想定)が参照される
-            item["seq_img_feat"] = self.image_features[input_ids]
-
-        # テキスト特徴量
-        if self.text_features is not None:
-            item["seq_text_feat"] = self.text_features[input_ids]
-
         return item
-
 
 def data_collator(features):
     """
@@ -126,23 +125,88 @@ def data_collator(features):
     return batch
 
 
-def create_datasets(data_path, max_len=50, image_feat=None, text_feat=None):
-    """
-    Many-to-Many 学習用にデータセットを作成するファクトリー関数
-    """
-    import os
-    
-    # 1. データの読み込み
-    # datamaps.json などが必要ならここで読み込む
-    
-    # 画像欠損IDの読み込み (オプション)
-    missing_image_ids = set()
-    missing_path = os.path.join(data_path, 'missing_asins.txt')
-    if os.path.exists(missing_path):
-        # datamaps.json をロードして変換するロジックが必要ならここに追加
-        pass
+@dataclass
+class Item:
+    item_id: int
+    asin: str
+    title: str
+    description: str
+    price: float
+    brand: str
+    categories: str
+    image_path: str     # Local path to the image file
 
-    # sequential_data.txt の読み込み
+class ItemDataset(Dataset):
+    def __init__(self, items: Dict[Any, Item]):
+        self.items = items
+        self.asin_to_id = {item.asin: item.item_id for item in items.values()}
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        return self.items[idx]
+
+    def get_item_by_asin(self, asin: str) -> Optional[Item]:
+        item_id = self.asin_to_id.get(asin)
+        if item_id is not None:
+            return self[item_id]
+        return None
+
+def load_missing_ids(file_path, datamaps):
+    missing_image_ids = set()
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            for line in f:
+                asin = line.strip()
+                if asin in datamaps.item2id:
+                    missing_image_ids.add(datamaps.item2id[asin])
+    return missing_image_ids
+
+def load_item_meta(data_path, datamaps):
+    meta_sub_path = os.path.join(data_path, 'meta_sub.jsonl')
+    if not os.path.exists(meta_sub_path):
+        print(f"Creating meta_sub.jsonl at {meta_sub_path}...")
+        items = []
+        for i, line in enumerate(gzip.open(os.path.join(data_path, 'meta.json.gz'), 'rt', encoding='utf-8')):
+            item_info = ast.literal_eval(line.strip())
+            if i == 0:
+                print(f"Example item info: {item_info}")
+            asin = item_info['asin']
+            if asin in datamaps.item2id:
+                item_id = datamaps.item2id[asin]
+                items.append({
+                    "item_id": item_id,
+                    "asin": asin,
+                    "title": item_info.get('title', None),
+                    "description": item_info.get('description', None),
+                    "price": item_info.get('price', None),
+                    "brand": item_info.get('brand', None),
+                    "categories": item_info.get('categories', None)
+                })
+        with open(meta_sub_path, 'w', encoding='utf-8') as out_f:
+            for item in sorted(items, key=lambda x: x['item_id']):
+                out_f.write(json.dumps(item) + "\n")
+    
+    items = {}
+    for line in open(meta_sub_path, 'r', encoding='utf-8'):
+        item_info = json.loads(line.strip())
+        item_id = item_info['item_id']
+        asin = item_info['asin']
+        title = item_info.get('title', None)
+        description = item_info.get('description', None)
+        price = item_info.get('price', None)
+        categories = item_info.get('categories', None)
+        categories = categories[0] if categories else None  # カテゴリはリストの最初の要素を使用
+        brand = item_info.get('brand', None)
+        image_path = os.path.join(data_path, 'images', f"{asin}.jpg")  # 画像のローカルパス
+        items[item_id] = Item(item_id=item_id, asin=asin, title=title, description=description, price=price, brand=brand, categories=categories, image_path=image_path)
+
+    return ItemDataset(items)
+
+
+
+def load_seq_data(data_path, missing_image_ids, max_len=50, pad_token=0):
     user_ids = []
     sequences = []
     with open(os.path.join(data_path, 'sequential_data.txt'), 'r') as f:
@@ -153,7 +217,7 @@ def create_datasets(data_path, max_len=50, image_feat=None, text_feat=None):
             user_ids.append(line_ids[0])
 
     data_splits = {
-        "train": {"seqs": [], "targets": None}, # Trainはtargets=None (自動生成)
+        "train": {"seqs": [], "targets": None}, # For Train, targets=None (automatic Many-to-Many mode)
         "eval":  {"seqs": [], "targets": []},
         "test":  {"seqs": [], "targets": []}
     }
@@ -200,8 +264,6 @@ def create_datasets(data_path, max_len=50, image_feat=None, text_feat=None):
         user_seqs=data_splits["train"]["seqs"],
         targets=None, # これが Many-to-Many モードのトリガー
         max_len=max_len,
-        image_features=image_feat,
-        text_features=text_feat,
         pad_token=0
     )
     
@@ -210,8 +272,6 @@ def create_datasets(data_path, max_len=50, image_feat=None, text_feat=None):
         user_seqs=data_splits["eval"]["seqs"],
         targets=data_splits["eval"]["targets"],
         max_len=max_len,
-        image_features=image_feat,
-        text_features=text_feat,
         pad_token=0
     )
     
@@ -220,19 +280,41 @@ def create_datasets(data_path, max_len=50, image_feat=None, text_feat=None):
         user_seqs=data_splits["test"]["seqs"],
         targets=data_splits["test"]["targets"],
         max_len=max_len,
-        image_features=image_feat,
-        text_features=text_feat,
         pad_token=0
     )
         
     return datasets
 
+def create_datasets(data_path, max_len=50):
+    """
+    Many-to-Many 学習用にデータセットを作成するファクトリー関数
+    """
+    
+    # 1. Load data maps
+    datamaps = DataMap(data_path)
+    print(f"Number of items: {len(datamaps.id2item)}")
+    
+    # [Optional] Load missing image IDs (This is used to filter out test/eval samples that have missing images, as per the original code's logic)
+    missing_image_ids = load_missing_ids(os.path.join(data_path, 'missing_asins.txt'), datamaps)
+    print(f"Loaded {len(missing_image_ids)} missing image IDs. {missing_image_ids}")
 
-if __name__ == "__main__":
+    # 2. Load item metadata (ASIN, text, image path)
+    item_dataset = load_item_meta(data_path, datamaps)
+
+    # 3. Load sequential_data.txt
+    dataset = load_seq_data(data_path, missing_image_ids, max_len=max_len, pad_token=0)
+
+    return dataset, item_dataset
+
+
+def test_dataset_creation():
+    import time
+
     # Example usage
     categories = ["toys", "beauty", "sports"]
 
     datasets = {}
+    item_datasets = {}
 
     for category in categories:
         data_dir = f"dataset/{category}"
@@ -242,14 +324,18 @@ if __name__ == "__main__":
         # image_feat = torch.load("image_features.pt")  # (num_items + 1, dim)
         # text_feat = torch.load("text_features.pt")    # (num_items + 1, dim)
     
-        datasets[category] = create_datasets(data_dir, max_len)
+        datasets[category], item_datasets[category] = create_datasets(data_dir, max_len)
         
         print(f"Category: {category}")
+        print(f"\tNumber of items: {len(item_datasets[category])}")
         avg_seq_len = np.mean([len(seq) for seq in datasets[category]['train'].user_seqs])
-        print(f"\tAverage sequence length (train): {avg_seq_len:.2f}")
         print(f"\tTrain samples: {len(datasets[category]['train'])}")
         print(f"\tEval samples: {len(datasets[category]['eval'])}")
         print(f"\tTest samples: {len(datasets[category]['test'])}")
+        print(f"\tAverage sequence length (train): {avg_seq_len:.2f}")
+        print()
+        print(f"\tExample item: {item_datasets[category][1]}")  # 最初のアイテムの例を表示
+        image = Image.open(item_datasets[category][1].image_path)
 
         # 4. DataLoader
         train_loader = DataLoader(datasets[category]["train"], batch_size=128, shuffle=True, collate_fn=data_collator)
@@ -260,3 +346,13 @@ if __name__ == "__main__":
             print(batch["input_ids"].shape)  # (batch_size, max_len)
             print(batch["labels"].shape)   # (batch_size,)
             break
+
+def test_datamap_loading():
+    data_path = "dataset/toys"
+    datamap = DataMap(data_path)
+    print(f"Number of items: {len(datamap.id2item)}")
+    print(f"Example item2id: {list(datamap.item2id.items())[:5]}")
+
+if __name__ == "__main__":
+    test_dataset_creation()
+    # test_datamap_loading()
