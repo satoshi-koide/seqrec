@@ -1,3 +1,4 @@
+from typing import Literal
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -20,6 +21,7 @@ class SASRecConfig(PretrainedConfig):
         dropout_rate=0.2,
         use_rating=False,
         pad_token_id=0,
+        feature_extractor: Literal["none", "frozen", "trainable"] = None,
         **kwargs
     ):
         """
@@ -40,6 +42,7 @@ class SASRecConfig(PretrainedConfig):
         self.num_heads = num_heads
         self.dropout_rate = dropout_rate
         self.use_rating = use_rating
+        self.feature_extractor = feature_extractor
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
 
@@ -107,6 +110,14 @@ class SASRec(PreTrainedModel):
 
     def __init__(self, config, feature_store: ItemFeatureStore=None):
         super().__init__(config)
+
+        if config.feature_extractor != "none" and feature_store is None:
+            raise ValueError("feature_store must be provided if feature_extractor is enabled in config.")
+        if config.feature_extractor == "frozen" and feature_store.is_trainable:
+            raise ValueError("feature_store must be frozen if feature_extractor is set to 'frozen'.")
+        if config.feature_extractor == "trainable" and not feature_store.is_trainable:
+            raise ValueError("feature_store must be trainable if feature_extractor is set to 'trainable'.")
+
         self.num_items = config.num_items
         self.hidden_units = config.hidden_units
         self.max_len = config.max_len

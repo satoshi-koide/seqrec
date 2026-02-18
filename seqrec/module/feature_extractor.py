@@ -31,6 +31,10 @@ class ItemFeatureExtractor(nn.Module):
             self.img_model = None
             self.missing_image_embedding = None
 
+        feature_dims = self.feature_dims()
+        self.fallback_text = torch.zeros(feature_dims["text_feature_dim"])   # should be CPU tensor
+        self.fallback_image = torch.zeros(feature_dims["image_feature_dim"]) # should be CPU tensor
+
     def feature_dims(self):
         text_dim = self.text_model.get_sentence_embedding_dimension() if self.text_model else 0
         image_dim = self.img_model.config.hidden_size if self.img_model else 0
@@ -56,8 +60,8 @@ class ItemFeatureExtractor(nn.Module):
             image_features: (batch_size, image_dim)
         """
         # データ展開
-        texts = [item.serialize() for item in items]
-        img_paths = [item.image_path for item in items]
+        texts = [None if item is None else item.serialize() for item in items]
+        img_paths = [None if item is None else item.image_path for item in items]
         
         device = next(self.parameters()).device
 
@@ -65,13 +69,15 @@ class ItemFeatureExtractor(nn.Module):
         # 1. Text Feature Extraction
         # -------------------------------------------------------
         # SentenceTransformerの tokenize -> forward を手動で行い、勾配計算の道を残す
-        text_inputs = self.text_model.tokenize(texts)
-        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-
-        
-        text_outputs = self.text_model(text_inputs)
-        # SentenceTransformerの標準的な出力キー 'sentence_embedding' を使用
-        text_features = text_outputs['sentence_embedding']
+        valid_index = [i for i, t in enumerate(texts) if t is not None]
+        text_features = torch.zeros((len(items), self.feature_dims()["text_feature_dim"]), device=device)
+        if self.text_model and valid_index:
+            valid_texts = [texts[i] for i in valid_index]
+            text_inputs = self.text_model.tokenize(valid_texts)
+            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+            
+            text_outputs = self.text_model(text_inputs)
+            text_features[valid_index] = text_outputs['sentence_embedding']
 
         # -------------------------------------------------------
         # 2. Image Feature Extraction
@@ -111,9 +117,7 @@ class ItemFeatureStore(ItemFeatureExtractor):
         self.item_dataset = item_dataset
         self.is_trainable = is_trainable
 
-        if self.is_trainable:
-            raise NotImplementedError("Trainable feature store is not implemented yet.")
-        else:
+        if not self.is_trainable:
             # set requires_grad to False for all parameters
             for param in self.text_model.parameters():
                 param.requires_grad = False
@@ -121,9 +125,6 @@ class ItemFeatureStore(ItemFeatureExtractor):
                 param.requires_grad = False
 
         self.feature_cache = {}
-        feature_dims = self.feature_dims()
-        self.fallback_text = torch.zeros(feature_dims["text_feature_dim"])   # should be CPU tensor
-        self.fallback_image = torch.zeros(feature_dims["image_feature_dim"]) # should be CPU tensor
 
         # self.register_buffer("fallback_text", fallback_text)
         # self.register_buffer("fallback_image", fallback_image)
@@ -158,6 +159,7 @@ class ItemFeatureStore(ItemFeatureExtractor):
         else:
             original_shape = item_ids.shape
             item_ids = item_ids.view(-1).tolist()  # Flatten to 1D
+
         if self.is_trainable:
             items =[self.item_dataset[item_id] for item_id in item_ids]
             features = super().forward(items)
@@ -171,8 +173,8 @@ class ItemFeatureStore(ItemFeatureExtractor):
                 else:
                     text_feats.append(self.fallback_text)
                     image_feats.append(self.fallback_image)
-        text_feats = torch.stack(text_feats).to(next(self.parameters()).device).view(*original_shape, -1)
-        image_feats = torch.stack(image_feats).to(next(self.parameters()).device).view(*original_shape, -1)
+            text_feats = torch.stack(text_feats).to(next(self.parameters()).device).view(*original_shape, -1)
+            image_feats = torch.stack(image_feats).to(next(self.parameters()).device).view(*original_shape, -1)
         
         return {"text_features": text_feats, "image_features": image_feats}
 

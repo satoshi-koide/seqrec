@@ -156,7 +156,9 @@ class ItemDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
-        return self.items[idx]
+        if idx in self.items:
+            return self.items[idx]
+        return None
 
     def get_item_by_asin(self, asin: str) -> Optional[Item]:
         item_id = self.asin_to_id.get(asin)

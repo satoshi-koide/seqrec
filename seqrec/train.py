@@ -86,7 +86,7 @@ def compute_metrics(eval_pred: EvalPrediction):
         "ndcg_at_10": ndcg
     }
 
-def main(dataset_path: str, enable_feature_extractor: bool):
+def main(dataset_path: str, feature_extractor: str = 'none'):
 
     datasets, item_dataset = create_datasets(dataset_path)
     num_actual_items = get_num_items(dataset_path)
@@ -101,6 +101,7 @@ def main(dataset_path: str, enable_feature_extractor: bool):
         text_feature_dim=0,
         num_blocks=3,
         num_heads=2,
+        feature_extractor=feature_extractor,
     )
 
     training_args = TrainingArguments(
@@ -108,7 +109,7 @@ def main(dataset_path: str, enable_feature_extractor: bool):
         
         # 学習設定
         num_train_epochs=20,
-        per_device_train_batch_size=128,
+        per_device_train_batch_size=128 if feature_extractor != "trainable" else 16,
         per_device_eval_batch_size=128, # 注意: メモリ圧迫する場合は下げる
         learning_rate=1e-3,
         weight_decay=0.01,
@@ -129,8 +130,9 @@ def main(dataset_path: str, enable_feature_extractor: bool):
 
     # 1. モデル初期化
     # feature_store = None
-    if enable_feature_extractor:
-        feature_store = ItemFeatureStore(item_dataset).to("cuda" if torch.cuda.is_available() else "cpu")
+    if feature_extractor != "none":
+        is_trainable = feature_extractor == "trainable"
+        feature_store = ItemFeatureStore(item_dataset, is_trainable).to("cuda" if torch.cuda.is_available() else "cpu")
         feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
     else:
         feature_store = None
@@ -154,4 +156,8 @@ def main(dataset_path: str, enable_feature_extractor: bool):
     print("Test Metrics:", test_metrics)
     
 if __name__ == "__main__":
-    main("dataset/sports", enable_feature_extractor=True)
+    categories = ['toys', 'sports', 'beauty']
+    for category in categories:
+        print(f"=== Training on {category} category ===")
+        dataset_path = f"dataset/{category}"
+        main(dataset_path, feature_extractor="trainable")
