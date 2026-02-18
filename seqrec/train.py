@@ -133,7 +133,8 @@ def main(dataset_path: str, feature_extractor: str = 'none'):
         greater_is_better=True,
         
         # 高速化・ログ
-        fp16=torch.cuda.is_available(), # GPUがあればFP16有効化
+        #fp16=torch.cuda.is_available(), # GPUがあればFP16有効化
+        bf16=torch.cuda.is_available(), # GPUがあればBF16有効化
         logging_dir='./logs',
         logging_steps=50,
         dataloader_num_workers=4, # データローダーの並列数

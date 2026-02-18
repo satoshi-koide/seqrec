@@ -9,22 +9,27 @@ import torch.nn as nn
 from transformers import ViTModel, ViTImageProcessor
 from sentence_transformers import SentenceTransformer
 
+from seqrec.utils import get_optimal_attention_config
+
 class ItemFeatureExtractor(nn.Module):
     def __init__(self, 
                  text_model_name: str = 'all-mpnet-base-v2',
                  image_model_name: str = 'google/vit-base-patch16-224-in21k',
                  cache_images: bool = False):
         super().__init__()
+
+        # check if flash attention 2 is available (PyTorch 2.0+ and compatible hardware)
+        attn_config = get_optimal_attention_config()
         
         # --- Text Module ---
         if text_model_name:
-            self.text_model = SentenceTransformer(text_model_name)
+            self.text_model = SentenceTransformer(text_model_name, model_kwargs=attn_config)
         else:
             self.text_model = None
         
         # --- Image Module ---
         if image_model_name:
-            self.img_processor = ViTImageProcessor.from_pretrained(image_model_name)
+            self.img_processor = ViTImageProcessor.from_pretrained(image_model_name, **attn_config)
             self.img_model = ViTModel.from_pretrained(image_model_name)
             self.missing_image_embedding = nn.Parameter(torch.zeros(self.img_model.config.hidden_size))
         else:
