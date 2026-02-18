@@ -86,7 +86,8 @@ class ItemFeatureExtractor(nn.Module):
 
         # pil_images 内の None を missing_image_embedding で置き換えるためのマスク
         if self.img_processor and self.img_model:
-            valid_images = [img if img is not None else Image.new("RGB", (224, 224), color=(0, 0, 0)) for img in pil_images]
+            valid_images = [img for img in pil_images if img is not None]
+            valid_index = [i for i, img in enumerate(pil_images) if img is not None]
         
         img_inputs = self.img_processor(images=valid_images, return_tensors="pt")
         img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
@@ -95,12 +96,10 @@ class ItemFeatureExtractor(nn.Module):
         
         # Using ViT [CLS] token (index 0)
         # last_hidden_state: (batch, seq_len, hidden_size)
-        image_features = img_outputs.last_hidden_state[:, 0, :]
+        valid_image_features = img_outputs.last_hidden_state[:, 0, :]
 
         # None だった画像の特徴を missing_image_embedding に置き換える
-        if self.missing_image_embedding is not None:
-            none_mask = torch.tensor([img is None for img in pil_images], device=device)
-            image_features[none_mask] = self.missing_image_embedding
+        image_features = torch.stack([self.missing_image_embedding if img is None else valid_image_features[valid_index.index(i)] for i, img in enumerate(pil_images)], dim=0).to(device)
 
         return {"text_features": text_features, "image_features": image_features}
 
