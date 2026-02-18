@@ -20,7 +20,6 @@ class SASRecConfig(PretrainedConfig):
         num_heads=2,
         dropout_rate=0.2,
         use_rating=False,
-        pad_token_id=0,
         feature_extractor: Literal["none", "frozen", "trainable"] = None,
         **kwargs
     ):
@@ -33,7 +32,6 @@ class SASRecConfig(PretrainedConfig):
             num_heads (int): Number of Attention heads.
             dropout_rate (float): Dropout probability.
             use_rating (bool): Whether to use rating embeddings.
-            pad_token_id (int): ID used for padding.
         """
         self.num_items = num_items
         self.max_len = max_len
@@ -43,7 +41,7 @@ class SASRecConfig(PretrainedConfig):
         self.dropout_rate = dropout_rate
         self.use_rating = use_rating
         self.feature_extractor = feature_extractor
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__init__(**kwargs)
 
 
 # ==========================================
@@ -156,7 +154,7 @@ class SASRec(PreTrainedModel):
         self.last_layernorm = nn.LayerNorm(self.hidden_units)
 
         # --- Loss Function ---
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
         # Initialize weights
         self.post_init()

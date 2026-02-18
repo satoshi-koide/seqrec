@@ -21,109 +21,94 @@ class DataMap:
         self.id2item = {int(v): k for k, v in self.item2id.items()}
 
 class SequentialRecDataset(Dataset):
+    pad_token: int = 0
+    ignore_index: int = -100
+
     def __init__(self, 
                  user_seqs, 
                  targets=None, 
-                 max_len=50, 
-                 pad_token=0):
-        """
-        Args:
-            user_seqs (list): ユーザーごとのアイテムID履歴 [[1, 2, ...], ...]
-            targets (list, optional): Eval/Test用の正解アイテムIDリスト。
-                                      Noneの場合はTrainモード（Many-to-Many学習）として動作する。
-            max_len (int): 系列最大長
-            pad_token (int): パディングに使用するID (Loss計算時に無視されるIDと同じである必要がある)
-        """
+                 max_len=50):
         self.user_seqs = user_seqs
         self.targets = targets
         self.max_len = max_len
-        self.pad_token = pad_token
 
     def __len__(self):
         return len(self.user_seqs)
 
     def __getitem__(self, index):
-        # 元の系列全体を取得
         seq = self.user_seqs[index]
         
         # -------------------------------------------------------
-        # Input と Labels の構築
+        # Input と Labels の構築 (パディングなし)
         # -------------------------------------------------------
         
         if self.targets is None:
-            # === Train Mode (Many-to-Many) ===
-            # 入力: [x1, x2, ..., x_{N-1}]
-            # 正解: [x2, x3, ..., x_N] (次のアイテム)
-            # 例: seq=[1, 2, 3] -> input=[1, 2], label=[2, 3]
-            
-            # 系列が短すぎる場合のガード
+            # === Train Mode ===
             if len(seq) < 2:
-                # 無効なデータとしてオール0などを返す（Dataset構築時に除外推奨）
+                # ガード: 無効な場合は長さ1のダミーを入れる
                 input_seq = [self.pad_token]
-                target_seq = [self.pad_token]
+                target_seq = [self.ignore_index]
             else:
                 input_seq = seq[:-1]
                 target_seq = seq[1:]
-                
-            # max_len に合わせて後ろから切り出す
+            
+            # max_len に合わせて「切り出し」だけ行う (パディングはしない)
+            # 例: [1, ..., 100] -> [51, ..., 100]
             input_seq = input_seq[-self.max_len:]
             target_seq = target_seq[-self.max_len:]
             
-            # パディングの準備
-            seq_len = len(input_seq)
-            input_ids = torch.full((self.max_len,), self.pad_token, dtype=torch.long)
-            labels = torch.full((self.max_len,), self.pad_token, dtype=torch.long) # 0はignore_indexとする
-            
-            # 後ろ詰め (Right Padding)
-            input_ids[self.max_len - seq_len:] = torch.tensor(input_seq, dtype=torch.long)
-            labels[self.max_len - seq_len:] = torch.tensor(target_seq, dtype=torch.long)
+            # Tensor化 (長さはバラバラのまま)
+            input_ids = torch.tensor(input_seq, dtype=torch.long)
+            labels = torch.tensor(target_seq, dtype=torch.long)
 
         else:
-            # === Eval/Test Mode (Many-to-One / Last Item Prediction) ===
-            # 入力: 履歴すべて (max_lenまで)
-            # 正解: 指定された target_id (最後のステップのみ有効、他は0埋め)
-            
+            # === Eval/Test Mode ===
             target_item = self.targets[index]
+            
+            # 入力系列の切り出し
             input_seq = seq[-self.max_len:]
-            seq_len = len(input_seq)
+            input_ids = torch.tensor(input_seq, dtype=torch.long)
             
-            input_ids = torch.full((self.max_len,), self.pad_token, dtype=torch.long)
-            labels = torch.full((self.max_len,), self.pad_token, dtype=torch.long) # 全て0(無視)で初期化
+            # ラベルの作成: 全て -100 で初期化
+            # 例: [-100, -100, ..., -100]
+            labels = torch.full((len(input_seq),), -100, dtype=torch.long)
             
-            # 入力を埋める
-            input_ids[self.max_len - seq_len:] = torch.tensor(input_seq, dtype=torch.long)
-            
-            # ラベルは「最後のステップ」だけ正解を入れる
-            # (入力系列の最後のアイテムを見た時点で、target_itemを予測してほしい)
-            labels[-1] = torch.tensor(target_item, dtype=torch.long)
+            # 最後の位置だけ正解を入れる
+            # Left Padding (右寄せ) するため、有効な系列の末尾が予測位置になります
+            labels[-1] = target_item
 
-        # -------------------------------------------------------
-        # 戻り値の作成
-        # -------------------------------------------------------
-        item = {
+        return {
             "input_ids": input_ids,
-            "labels": labels  # Trainerが自動的にLoss計算に使用
+            "labels": labels
         }
 
-        return item
+    @classmethod
+    def data_collator(cls, features):
+        input_ids_list = [f['input_ids'] for f in features]
+        labels_list = [f['labels'] for f in features]
+        
+        max_seq_len = max(len(ids) for ids in input_ids_list)
+        batch_size = len(features)
+        
+        # input_ids は 0 で埋める
+        padded_input_ids = torch.full(
+            (batch_size, max_seq_len), cls.pad_token, dtype=torch.long
+        )
+        # labels は -100 で埋める
+        padded_labels = torch.full(
+            (batch_size, max_seq_len), cls.ignore_index, dtype=torch.long
+        )
+        
+        for i, (inp, lbl) in enumerate(zip(input_ids_list, labels_list)):
+            seq_len = len(inp)
+            # Left Padding (後ろから詰める)
+            padded_input_ids[i, max_seq_len - seq_len:] = inp
+            padded_labels[i, max_seq_len - seq_len:] = lbl
 
-def data_collator(features):
-    """
-    バッチ構築関数
-    Datasetが既に整ったTensorを返しているので、stackするだけでOK
-    """
-    batch = {}
-    batch['input_ids'] = torch.stack([f['input_ids'] for f in features])
-    batch['labels'] = torch.stack([f['labels'] for f in features])
-    
-    if 'seq_img_feat' in features[0]:
-        batch['image_feats'] = torch.stack([f['seq_img_feat'] for f in features])
-    
-    if 'seq_text_feat' in features[0]:
-        batch['text_feats'] = torch.stack([f['seq_text_feat'] for f in features])
-
-    return batch
-
+        return {
+            "input_ids": padded_input_ids,
+            "labels": padded_labels
+        }
 
 @dataclass
 class Item:
@@ -219,7 +204,7 @@ def load_item_meta(data_path, datamaps):
 
 
 
-def load_seq_data(data_path, missing_image_ids, max_len=50, pad_token=0):
+def load_seq_data(data_path, missing_image_ids, max_len=50):
     user_ids = []
     sequences = []
     with open(os.path.join(data_path, 'sequential_data.txt'), 'r') as f:
@@ -277,7 +262,6 @@ def load_seq_data(data_path, missing_image_ids, max_len=50, pad_token=0):
         user_seqs=data_splits["train"]["seqs"],
         targets=None, # これが Many-to-Many モードのトリガー
         max_len=max_len,
-        pad_token=0
     )
     
     # Eval (targetsあり)
@@ -285,7 +269,6 @@ def load_seq_data(data_path, missing_image_ids, max_len=50, pad_token=0):
         user_seqs=data_splits["eval"]["seqs"],
         targets=data_splits["eval"]["targets"],
         max_len=max_len,
-        pad_token=0
     )
     
     # Test (targetsあり)
@@ -293,7 +276,6 @@ def load_seq_data(data_path, missing_image_ids, max_len=50, pad_token=0):
         user_seqs=data_splits["test"]["seqs"],
         targets=data_splits["test"]["targets"],
         max_len=max_len,
-        pad_token=0
     )
         
     return datasets
@@ -315,7 +297,7 @@ def create_datasets(data_path, max_len=50):
     item_dataset = load_item_meta(data_path, datamaps)
 
     # 3. Load sequential_data.txt
-    dataset = load_seq_data(data_path, missing_image_ids, max_len=max_len, pad_token=0)
+    dataset = load_seq_data(data_path, missing_image_ids, max_len=max_len)
 
     return dataset, item_dataset
 
@@ -328,6 +310,8 @@ def test_dataset_creation():
 
     datasets = {}
     item_datasets = {}
+
+    data_collator = SequentialRecDataset.data_collator
 
     for category in categories:
         data_dir = f"dataset/{category}"
