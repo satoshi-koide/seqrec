@@ -19,8 +19,6 @@ class SASRecConfig(PretrainedConfig):
         num_heads=2,
         dropout_rate=0.2,
         use_rating=False,
-        image_model_name=None,
-        text_model_name=None,
         pad_token_id=0,
         **kwargs
     ):
@@ -166,8 +164,6 @@ class SASRec(PreTrainedModel):
         self, 
         input_ids, 
         labels=None, 
-        image_feats=None, 
-        text_feats=None, 
         input_ratings=None, 
         **kwargs
     ):

@@ -86,7 +86,7 @@ def compute_metrics(eval_pred: EvalPrediction):
         "ndcg_at_10": ndcg
     }
 
-def main(dataset_path: str = "dataset/toys"):
+def main(dataset_path: str, enable_feature_extractor: bool):
 
     datasets, item_dataset = create_datasets(dataset_path)
     num_actual_items = get_num_items(dataset_path)
@@ -129,8 +129,12 @@ def main(dataset_path: str = "dataset/toys"):
 
     # 1. モデル初期化
     # feature_store = None
-    feature_store = ItemFeatureStore(item_dataset).to("cuda" if torch.cuda.is_available() else "cpu")
-    feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
+    if enable_feature_extractor:
+        feature_store = ItemFeatureStore(item_dataset).to("cuda" if torch.cuda.is_available() else "cpu")
+        feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
+    else:
+        feature_store = None
+
     model = SASRec(model_config, feature_store=feature_store)
     # 2. Trainerに直接渡す
     trainer = Trainer(
@@ -150,4 +154,4 @@ def main(dataset_path: str = "dataset/toys"):
     print("Test Metrics:", test_metrics)
     
 if __name__ == "__main__":
-    main("dataset/sports")
+    main("dataset/sports", enable_feature_extractor=True)
