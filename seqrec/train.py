@@ -45,7 +45,7 @@ def compute_metrics(eval_pred: EvalPrediction):
     # preprocess で抽出済みなので、形状は以下の通り
     # logits: (Batch, NumItems)
     # labels: (Batch,) 
-    logits, labels = eval_pred.predictions, eval_pred.label_ids
+    logits, labels = eval_pred.predictions
     
     # --- 以降のロジックは以前と同じですが、ラベルのスライス処理が不要になります ---
 
