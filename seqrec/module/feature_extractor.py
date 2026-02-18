@@ -23,7 +23,7 @@ class ItemFeatureExtractor(nn.Module):
         
         # --- Text Module ---
         if text_model_name:
-            self.text_model = SentenceTransformer(text_model_name, model_kwargs=attn_config)
+            self.text_model = SentenceTransformer(text_model_name)
         else:
             self.text_model = None
         

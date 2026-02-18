@@ -189,7 +189,9 @@ class SASRec(PreTrainedModel):
 
         # 1. Embedding
         seqs = self.item_emb(input_ids)
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+        # positions = torch.arange(seq_len, device=device).unsqueeze(0) # 0, 1, ..., SeqLen-1
+        # max_len - SeqLen ... max_len -2, max_len - 1
+        positions = torch.arange(self.max_len - seq_len, self.max_len, device=device).unsqueeze(0)
         seqs += self.pos_emb(positions)
 
         # Side Information Integration (Add)
