@@ -95,23 +95,24 @@ def main(dataset_path: str, feature_extractor: str = 'none'):
         num_items=num_actual_items,
         max_len=50,
         hidden_units=64,
-        dropout_rate=0.2,
+        dropout_rate=0.2, # The original paper uses 0.5 for sparse datasets
         use_rating=False,
         image_feature_dim=0,
         text_feature_dim=0,
-        num_blocks=3,
-        num_heads=2,
+        num_blocks=2,
+        num_heads=1,   # The original paper recommends 1 head
         feature_extractor=feature_extractor,
     )
 
+    batch_size = 128 if feature_extractor != "trainable" else 16
     training_args = TrainingArguments(
         output_dir="./output_sasrec",
         
         # 学習設定
         num_train_epochs=20,
-        per_device_train_batch_size=128 if feature_extractor != "trainable" else 16,
-        per_device_eval_batch_size=128, # 注意: メモリ圧迫する場合は下げる
-        learning_rate=1e-3,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=64, # 注意: メモリ圧迫する場合は下げる
+        learning_rate=1e-3 * batch_size / 128, # バッチサイズに応じた学習率スケーリング
         weight_decay=0.01,
         
         # 評価設定
