@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from seqrec.module.feature_extractor import ItemFeatureStore
+
 # ==========================================
 # 1. Configuration Class
 # ==========================================
@@ -17,8 +19,8 @@ class SASRecConfig(PretrainedConfig):
         num_heads=2,
         dropout_rate=0.2,
         use_rating=False,
-        image_feature_dim=0,
-        text_feature_dim=0,
+        image_model_name=None,
+        text_model_name=None,
         pad_token_id=0,
         **kwargs
     ):
@@ -31,8 +33,6 @@ class SASRecConfig(PretrainedConfig):
             num_heads (int): Number of Attention heads.
             dropout_rate (float): Dropout probability.
             use_rating (bool): Whether to use rating embeddings.
-            image_feature_dim (int): Dimension of input image features (0 to disable).
-            text_feature_dim (int): Dimension of input text features (0 to disable).
             pad_token_id (int): ID used for padding.
         """
         self.num_items = num_items
@@ -42,8 +42,6 @@ class SASRecConfig(PretrainedConfig):
         self.num_heads = num_heads
         self.dropout_rate = dropout_rate
         self.use_rating = use_rating
-        self.image_feature_dim = image_feature_dim
-        self.text_feature_dim = text_feature_dim
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
 
@@ -109,7 +107,7 @@ class SASRecLayer(nn.Module):
 class SASRec(PreTrainedModel):
     config_class = SASRecConfig
 
-    def __init__(self, config):
+    def __init__(self, config, feature_store: ItemFeatureStore=None):
         super().__init__(config)
         self.num_items = config.num_items
         self.hidden_units = config.hidden_units
@@ -125,11 +123,17 @@ class SASRec(PreTrainedModel):
             # 1-5 stars + 0 padding = 6
             self.rating_emb = nn.Embedding(6, self.hidden_units, padding_idx=0)
         
-        if config.image_feature_dim > 0:
-            self.img_proj = nn.Linear(config.image_feature_dim, self.hidden_units)
-        
-        if config.text_feature_dim > 0:
-            self.text_proj = nn.Linear(config.text_feature_dim, self.hidden_units)
+        self.feature_store = feature_store
+        if self.feature_store:
+            feature_dims = self.feature_store.feature_dims()
+            if feature_dims["image_feature_dim"] > 0:
+                self.img_proj = nn.Linear(feature_dims["image_feature_dim"], self.hidden_units)
+            else:
+                self.img_proj = None
+            if feature_dims["text_feature_dim"] > 0:
+                self.text_proj = nn.Linear(feature_dims["text_feature_dim"], self.hidden_units)
+            else:
+                self.text_proj = None
 
         # --- Transformer Blocks ---
         self.blocks = nn.ModuleList([
@@ -186,11 +190,15 @@ class SASRec(PreTrainedModel):
         # Side Information Integration (Add)
         if input_ratings is not None and hasattr(self, 'rating_emb'):
             seqs += self.rating_emb(input_ratings)
-        if image_feats is not None and hasattr(self, 'img_proj'):
-            # Projection: (B, L, ImgDim) -> (B, L, Hidden)
-            seqs += self.img_proj(image_feats)
-        if text_feats is not None and hasattr(self, 'text_proj'):
-            seqs += self.text_proj(text_feats)
+
+        if self.feature_store:
+            features = self.feature_store(input_ids)
+            if self.img_proj is not None:
+                # Projection: (B, L, ImgDim) -> (B, L, Hidden)
+                seqs += self.img_proj(features["image_features"])
+            if self.text_proj is not None:
+                # Projection: (B, L, TxtDim) -> (B, L, Hidden)
+                seqs += self.text_proj(features["text_features"])
 
         seqs = self.emb_dropout(seqs)
 
@@ -216,8 +224,6 @@ class SASRec(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            # Shiftさせて予測する場合と、Dataset側ですでにズレている場合がある
-            # 今回のDataset実装は「InputとLabelsがズレている」のでそのまま計算
             loss = self.criterion(logits.view(-1, self.num_items), labels.view(-1))
 
         return {

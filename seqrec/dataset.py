@@ -4,7 +4,7 @@ import gzip
 import json
 import numpy as np
 from PIL import Image
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, ClassVar
 from dataclasses import dataclass
 
 import torch
@@ -135,6 +135,17 @@ class Item:
     brand: str
     categories: str
     image_path: str     # Local path to the image file
+
+    serialize_template: ClassVar[str] = "Item Title: {title}\nBrand: {brand}\nCategory: {categories}\nPrice: ${price}\nDescription: {description}"
+
+    def serialize(self):
+        return self.serialize_template.format(
+            title=self.title,
+            brand=self.brand,
+            categories=', '.join(self.categories) if isinstance(self.categories, list) else self.categories,
+            price=self.price,
+            description=self.description
+        )
 
 class ItemDataset(Dataset):
     def __init__(self, items: Dict[Any, Item]):

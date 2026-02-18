@@ -4,8 +4,9 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import Trainer, TrainingArguments, EvalPrediction
 
-from dataset import create_datasets, data_collator
-from module.sasrec import SASRec, SASRecConfig
+from seqrec.dataset import create_datasets, data_collator
+from seqrec.module.sasrec import SASRec, SASRecConfig
+from seqrec.module.feature_extractor import ItemFeatureStore
 
 def get_num_items(data_path):
     with open(f'{data_path}/datamaps.json', 'r') as f:
@@ -87,7 +88,7 @@ def compute_metrics(eval_pred: EvalPrediction):
 
 def main(dataset_path: str = "dataset/toys"):
 
-    datasets = create_datasets(dataset_path)
+    datasets, item_dataset = create_datasets(dataset_path)
     num_actual_items = get_num_items(dataset_path)
 
     model_config = SASRecConfig(
@@ -127,8 +128,10 @@ def main(dataset_path: str = "dataset/toys"):
     )    
 
     # 1. モデル初期化
-    model = SASRec(model_config)
-
+    # feature_store = None
+    feature_store = ItemFeatureStore(item_dataset).to("cuda" if torch.cuda.is_available() else "cpu")
+    feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
+    model = SASRec(model_config, feature_store=feature_store)
     # 2. Trainerに直接渡す
     trainer = Trainer(
         model=model,  # ラッパー不要！
@@ -147,4 +150,4 @@ def main(dataset_path: str = "dataset/toys"):
     print("Test Metrics:", test_metrics)
     
 if __name__ == "__main__":
-    main("dataset/beauty")
+    main("dataset/sports")
