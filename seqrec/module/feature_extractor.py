@@ -12,7 +12,8 @@ from sentence_transformers import SentenceTransformer
 class ItemFeatureExtractor(nn.Module):
     def __init__(self, 
                  text_model_name: str = 'all-mpnet-base-v2',
-                 image_model_name: str = 'google/vit-base-patch16-224-in21k'):
+                 image_model_name: str = 'google/vit-base-patch16-224-in21k',
+                 cache_images: bool = False):
         super().__init__()
         
         # --- Text Module ---
@@ -30,6 +31,10 @@ class ItemFeatureExtractor(nn.Module):
             self.img_processor = None
             self.img_model = None
             self.missing_image_embedding = None
+
+        self.cache_images = cache_images
+        if self.cache_images and self.img_model:
+            self.image_cache = {}
 
         feature_dims = self.feature_dims()
         self.fallback_text = torch.zeros(feature_dims["text_feature_dim"])   # should be CPU tensor
@@ -89,7 +94,7 @@ class ItemFeatureExtractor(nn.Module):
             valid_images = [img for img in pil_images if img is not None]
             valid_index = [i for i, img in enumerate(pil_images) if img is not None]
         
-        img_inputs = self.img_processor(images=valid_images, return_tensors="pt")
+        img_inputs = self.img_processor(images=valid_images, return_tensors="pt") # これは何度も呼ばれている。キャッシュできるかも。ただ data augmentation で毎回違う画像を入れる可能性もあるので要検討。
         img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
         
         img_outputs = self.img_model(**img_inputs)
