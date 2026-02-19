@@ -20,7 +20,9 @@ class SASRecConfig(PretrainedConfig):
         num_heads=2,
         dropout_rate=0.2,
         use_rating=False,
-        feature_extractor: Literal["none", "frozen", "trainable"] = None,
+        feature_extractor: Literal["frozen", "trainable"] = "frozen",
+        text_model_name: str = None,
+        image_model_name: str = None,
         **kwargs
     ):
         """
@@ -32,6 +34,8 @@ class SASRecConfig(PretrainedConfig):
             num_heads (int): Number of Attention heads.
             dropout_rate (float): Dropout probability.
             use_rating (bool): Whether to use rating embeddings.
+            text_model_name (str): Name of the text model for feature extraction.
+            image_model_name (str): Name of the image model for feature extraction.
         """
         self.num_items = num_items
         self.max_len = max_len
@@ -41,6 +45,8 @@ class SASRecConfig(PretrainedConfig):
         self.dropout_rate = dropout_rate
         self.use_rating = use_rating
         self.feature_extractor = feature_extractor
+        self.text_model_name = text_model_name
+        self.image_model_name = image_model_name
         super().__init__(**kwargs)
 
 
@@ -109,13 +115,6 @@ class SASRec(PreTrainedModel):
     def __init__(self, config, feature_store: ItemFeatureStore=None):
         super().__init__(config)
 
-        if config.feature_extractor != "none" and feature_store is None:
-            raise ValueError("feature_store must be provided if feature_extractor is enabled in config.")
-        if config.feature_extractor == "frozen" and feature_store.is_trainable:
-            raise ValueError("feature_store must be frozen if feature_extractor is set to 'frozen'.")
-        if config.feature_extractor == "trainable" and not feature_store.is_trainable:
-            raise ValueError("feature_store must be trainable if feature_extractor is set to 'trainable'.")
-
         self.num_items = config.num_items
         self.hidden_units = config.hidden_units
         self.max_len = config.max_len
@@ -133,12 +132,12 @@ class SASRec(PreTrainedModel):
         self.feature_store = feature_store
         if self.feature_store:
             feature_dims = self.feature_store.feature_dims()
-            if feature_dims["image_feature_dim"] > 0:
-                self.img_proj = nn.Linear(feature_dims["image_feature_dim"], self.hidden_units)
+            if "image_features" in feature_dims and feature_dims["image_features"] > 0:
+                self.img_proj = nn.Linear(feature_dims["image_features"], self.hidden_units)
             else:
                 self.img_proj = None
-            if feature_dims["text_feature_dim"] > 0:
-                self.text_proj = nn.Linear(feature_dims["text_feature_dim"], self.hidden_units)
+            if "text_features" in feature_dims and feature_dims["text_features"] > 0:
+                self.text_proj = nn.Linear(feature_dims["text_features"], self.hidden_units)
             else:
                 self.text_proj = None
 

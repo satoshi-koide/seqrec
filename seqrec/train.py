@@ -5,7 +5,7 @@ from transformers import Trainer, TrainingArguments, EvalPrediction
 
 from seqrec.dataset import create_datasets, SequentialRecDataset
 from seqrec.module.sasrec import SASRec, SASRecConfig
-from seqrec.module.feature_extractor import ItemFeatureStore
+from seqrec.module.feature_extractor import initialize_item_feature_store
 
 def get_num_items(data_path):
     with open(f'{data_path}/datamaps.json', 'r') as f:
@@ -95,7 +95,7 @@ def compute_metrics(eval_pred: EvalPrediction):
         "ndcg_at_10": ndcg
     }
 
-def main(dataset_path: str, feature_extractor: str = 'none'):
+def main(dataset_path: str, feature_extractor: str = 'none', text_model_name: str = None, image_model_name: str = None):
 
     datasets, item_dataset = create_datasets(dataset_path)
     num_actual_items = get_num_items(dataset_path)
@@ -107,11 +107,11 @@ def main(dataset_path: str, feature_extractor: str = 'none'):
         hidden_units=64,
         dropout_rate=0.2, # The original paper uses 0.5 for sparse datasets
         use_rating=False,
-        image_feature_dim=0,
-        text_feature_dim=0,
         num_blocks=2,
         num_heads=1,   # The original paper recommends 1 head
         feature_extractor=feature_extractor,
+        text_model_name=text_model_name,
+        image_model_name=image_model_name,
     )
 
     batch_size = 128 if feature_extractor != "trainable" else 20
@@ -141,11 +141,17 @@ def main(dataset_path: str, feature_extractor: str = 'none'):
     )    
 
     # 1. モデル初期化
-    # feature_store = None
-    if feature_extractor != "none":
+    if model_config.text_model_name or model_config.image_model_name:
         is_trainable = feature_extractor == "trainable"
-        feature_store = ItemFeatureStore(item_dataset, is_trainable).to("cuda" if torch.cuda.is_available() else "cpu")
-        feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
+        feature_store = initialize_item_feature_store(
+            item_dataset, 
+            text_model_name=model_config.text_model_name,
+            image_model_name=model_config.image_model_name,
+            is_trainable=is_trainable,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        if not is_trainable:
+            feature_store.build_cache(batch_size=128, verbose=True)  # キャッシュ構築
     else:
         feature_store = None
 
@@ -169,8 +175,19 @@ def main(dataset_path: str, feature_extractor: str = 'none'):
     
 if __name__ == "__main__":
     categories = ['toys', 'sports', 'beauty']
+
+    text_model_name=None
     for category in categories:
-        print(f"=== Training on {category} category ===")
-        dataset_path = f"dataset/{category}"
+        for image_model_name in ["google/vit-base-patch16-224-in21k", None]:
+            print(f"=== Training on {category} category ===")
+            dataset_path = f"dataset/{category}"
+
+            #text_model_name="all_mpnet_base_v2",
+
+            main(
+                dataset_path,
+                feature_extractor="frozen",
+                text_model_name=text_model_name,
+                image_model_name=image_model_name,
+            )
         #main(dataset_path, feature_extractor="trainable")
-        main(dataset_path, feature_extractor="frozen")

@@ -1,4 +1,5 @@
-from typing import List, Union
+import abc
+from typing import List, Union, Dict, Optional
 from PIL import Image
 from seqrec.dataset import Item, ItemDataset
 from tqdm import tqdm
@@ -6,217 +7,294 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 
-from transformers import ViTModel, ViTImageProcessor
-from sentence_transformers import SentenceTransformer
+# ==========================================
+# 1. Encoder Abstractions (API依存の隠蔽)
+# ==========================================
 
-from seqrec.utils import get_optimal_attention_config
+class AbstractTextEncoder(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def get_output_dim(self) -> int:
+        pass
 
-class ItemFeatureExtractor(nn.Module):
-    def __init__(self, 
-                 text_model_name: str = 'all-mpnet-base-v2',
-                 image_model_name: str = 'google/vit-base-patch16-224-in21k',
-                 cache_images: bool = False):
+    @abc.abstractmethod
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        """文字列のリストを受け取り、(batch_size, dim) のテンソルを返す"""
+        pass
+
+class AbstractImageEncoder(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def get_output_dim(self) -> int:
+        pass
+
+    @abc.abstractmethod
+    def forward(self, images: List[Optional[Image.Image]]) -> torch.Tensor:
+        """PIL画像のリスト（None許容）を受け取り、(batch_size, dim) のテンソルを返す"""
+        pass
+
+# --- 具象エンコーダ (外部ライブラリのラッパー) ---
+
+class SentenceTransformerEncoder(AbstractTextEncoder):
+    def __init__(self, model_name: str = 'all-mpnet-base-v2'):
         super().__init__()
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
 
-        # check if flash attention 2 is available (PyTorch 2.0+ and compatible hardware)
+    def get_output_dim(self) -> int:
+        return self.model.get_sentence_embedding_dimension()
+
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        device = next(self.parameters()).device
+        # Noneを空文字に変換してSentenceTransformerに渡す
+        valid_texts = [t if t is not None else "" for t in texts]
+        inputs = self.model.tokenize(valid_texts)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        outputs = self.model(inputs)
+        return outputs['sentence_embedding']
+
+class ViTImageEncoder(AbstractImageEncoder):
+    def __init__(self, model_name: str = 'google/vit-base-patch16-224-in21k'):
+        super().__init__()
+        from transformers import ViTModel, ViTImageProcessor
+        from seqrec.utils import get_optimal_attention_config
+        
         attn_config = get_optimal_attention_config()
+        self.processor = ViTImageProcessor.from_pretrained(model_name, **attn_config)
+        self.model = ViTModel.from_pretrained(model_name)
+        self.missing_image_embedding = nn.Parameter(torch.zeros(self.model.config.hidden_size))
+
+    def get_output_dim(self) -> int:
+        return self.model.config.hidden_size
+
+    def forward(self, images: List[Optional[Image.Image]]) -> torch.Tensor:
+        device = next(self.parameters()).device
+        batch_size = len(images)
         
-        # --- Text Module ---
-        if text_model_name:
-            self.text_model = SentenceTransformer(text_model_name)
-        else:
-            self.text_model = None
-        
-        # --- Image Module ---
-        if image_model_name:
-            self.img_processor = ViTImageProcessor.from_pretrained(image_model_name, **attn_config)
-            self.img_model = ViTModel.from_pretrained(image_model_name)
-            self.missing_image_embedding = nn.Parameter(torch.zeros(self.img_model.config.hidden_size))
-        else:
-            self.img_processor = None
-            self.img_model = None
-            self.missing_image_embedding = None
+        valid_images = [img for img in images if img is not None]
+        valid_indices = [i for i, img in enumerate(images) if img is not None]
 
-        self.cache_images = cache_images
-        if self.cache_images and self.img_model:
-            self.image_cache = {}
+        # 初期値として欠損用エンベディングを敷き詰める
+        features = torch.stack([self.missing_image_embedding] * batch_size).to(device)
 
-        feature_dims = self.feature_dims()
-        self.fallback_text = torch.zeros(feature_dims["text_feature_dim"])   # should be CPU tensor
-        self.fallback_image = torch.zeros(feature_dims["image_feature_dim"]) # should be CPU tensor
+        if valid_images:
+            inputs = self.processor(images=valid_images, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            outputs = self.model(**inputs)
+            valid_features = outputs.last_hidden_state[:, 0, :]
+            
+            # 有効な画像の特徴量を元のインデックスに配置
+            for valid_idx, feature in zip(valid_indices, valid_features):
+                features[valid_idx] = feature
+                
+        return features
 
-    def feature_dims(self):
-        text_dim = self.text_model.get_sentence_embedding_dimension() if self.text_model else 0
-        image_dim = self.img_model.config.hidden_size if self.img_model else 0
-        return {"text_feature_dim": text_dim, "image_feature_dim": image_dim}
 
-    def _load_images(self, paths: List[str]) -> List[Image.Image]:
-        """画像パスからPIL Imageを読み込む内部ヘルパー"""
+# ==========================================
+# 2. Feature Extractors (モダリティの分離)
+# ==========================================
+
+class AbstractItemFeatureExtractor(nn.Module, abc.ABC):
+    @abc.abstractmethod
+    def feature_dims(self) -> Dict[str, int]:
+        """出力される特徴量の名前と次元数のマッピングを返す"""
+        pass
+
+    @abc.abstractmethod
+    def forward(self, items: List[Item]) -> Dict[str, torch.Tensor]:
+        """Itemのリストを受け取り、特徴量の辞書を返す"""
+        pass
+
+
+class TextFeatureExtractor(AbstractItemFeatureExtractor):
+    def __init__(self, encoder: AbstractTextEncoder, feature_key: str = "text_features"):
+        super().__init__()
+        self.encoder = encoder
+        self.feature_key = feature_key
+
+    def feature_dims(self) -> Dict[str, int]:
+        return {self.feature_key: self.encoder.get_output_dim()}
+
+    def forward(self, items: List[Item]) -> Dict[str, torch.Tensor]:
+        texts = [item.serialize() if item is not None else None for item in items]
+        features = self.encoder(texts)
+        return {self.feature_key: features}
+
+
+class ImageFeatureExtractor(AbstractItemFeatureExtractor):
+    def __init__(self, encoder: AbstractImageEncoder, feature_key: str = "image_features"):
+        super().__init__()
+        self.encoder = encoder
+        self.feature_key = feature_key
+
+    def _load_images(self, paths: List[Optional[str]]) -> List[Optional[Image.Image]]:
         images = []
         for p in paths:
-            try:
-                img = Image.open(p).convert("RGB")
-                images.append(img)
-            except Exception:
-                images.append(None)
+            if p:
+                try:
+                    images.append(Image.open(p).convert("RGB"))
+                    continue
+                except Exception:
+                    pass
+            images.append(None)
         return images
 
-    def forward(self, items: List[Item]):
-        """
-        Args:
-            items: Itemオブジェクトのリスト
-        Returns:
-            text_features: (batch_size, text_dim)
-            image_features: (batch_size, image_dim)
-        """
-        # データ展開
-        texts = [None if item is None else item.serialize() for item in items]
-        img_paths = [None if item is None else item.image_path for item in items]
-        
-        device = next(self.parameters()).device
+    def feature_dims(self) -> Dict[str, int]:
+        return {self.feature_key: self.encoder.get_output_dim()}
 
-        # -------------------------------------------------------
-        # 1. Text Feature Extraction
-        # -------------------------------------------------------
-        # SentenceTransformerの tokenize -> forward を手動で行い、勾配計算の道を残す
-        if self.text_model:
-            valid_index = [i for i, t in enumerate(texts) if t is not None]
-            text_features = torch.zeros((len(items), self.feature_dims()["text_feature_dim"]), device=device)
-            if self.text_model and valid_index:
-                valid_texts = [texts[i] for i in valid_index]
-                text_inputs = self.text_model.tokenize(valid_texts)
-                text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-                
-                text_outputs = self.text_model(text_inputs)
-                text_features[valid_index] = text_outputs['sentence_embedding']
-        else:
-            text_features = torch.zeros((len(items), 0), device=device)  # テキスト特徴がない場合は空のテンソル
-
-        # -------------------------------------------------------
-        # 2. Image Feature Extraction
-        # -------------------------------------------------------
-        if self.img_model:
-            pil_images = self._load_images(img_paths)
-
-            # pil_images 内の None を missing_image_embedding で置き換えるためのマスク
-            if self.img_processor and self.img_model:
-                valid_images = [img for img in pil_images if img is not None]
-                valid_index = [i for i, img in enumerate(pil_images) if img is not None]
-            
-            img_inputs = self.img_processor(images=valid_images, return_tensors="pt") # これは何度も呼ばれている。キャッシュできるかも。ただ data augmentation で毎回違う画像を入れる可能性もあるので要検討。
-            img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
-            
-            img_outputs = self.img_model(**img_inputs)
-            
-            # Using ViT [CLS] token (index 0)
-            # last_hidden_state: (batch, seq_len, hidden_size)
-            valid_image_features = img_outputs.last_hidden_state[:, 0, :]
-
-            # None だった画像の特徴を missing_image_embedding に置き換える
-            image_features = torch.stack([self.missing_image_embedding if img is None else valid_image_features[valid_index.index(i)] for i, img in enumerate(pil_images)], dim=0).to(device)
-        else:
-            image_features = torch.zeros((len(items), 0), device=device)  # 画像特徴がない場合は空のテンソル
-
-        return {"text_features": text_features, "image_features": image_features}
+    def forward(self, items: List[Item]) -> Dict[str, torch.Tensor]:
+        img_paths = [item.image_path if item is not None else None for item in items]
+        images = self._load_images(img_paths)
+        features = self.encoder(images)
+        return {self.feature_key: features}
 
 
+# ==========================================
+# 3. Composite Extractor (抽出器の合成)
+# ==========================================
 
-class ItemFeatureStore(ItemFeatureExtractor):
+class CombinedFeatureExtractor(AbstractItemFeatureExtractor):
+    def __init__(self, extractors: Dict[str, AbstractItemFeatureExtractor]):
+        super().__init__()
+        # ModuleDictを使うことで、内部のパラメータが自動的にPyTorchに認識される
+        self.extractors = nn.ModuleDict(extractors)
+
+    def feature_dims(self) -> Dict[str, int]:
+        dims = {}
+        for ext in self.extractors.values():
+            dims.update(ext.feature_dims())
+        return dims
+
+    def forward(self, items: List[Item]) -> Dict[str, torch.Tensor]:
+        output = {}
+        for ext in self.extractors.values():
+            output.update(ext(items))
+        return output
+
+
+# ==========================================
+# 4. Feature Store (抽出器の利用とキャッシュ)
+# ==========================================
+
+class ItemFeatureStore(nn.Module):
     def __init__(self, 
                  item_dataset: ItemDataset,
-                 is_trainable: bool = False,
-                 text_model_name: str = 'all-mpnet-base-v2',
-                 image_model_name: str = 'google/vit-base-patch16-224-in21k'):
-        super().__init__(text_model_name, image_model_name)
-
+                 feature_extractor: AbstractItemFeatureExtractor,
+                 is_trainable: bool = False):
+        super().__init__()
         self.item_dataset = item_dataset
+        self.extractor = feature_extractor
         self.is_trainable = is_trainable
 
         if not self.is_trainable:
-            # set requires_grad to False for all parameters
-            if self.text_model:
-                for param in self.text_model.parameters():
-                    param.requires_grad = False
-            if self.img_model:
-                for param in self.img_model.parameters():
-                    param.requires_grad = False
+            for param in self.extractor.parameters():
+                param.requires_grad = False
 
         self.feature_cache = {}
+        self.feature_dimensions = self.extractor.feature_dims()
+        
+        self.fallbacks = {
+            key: torch.zeros(dim) for key, dim in self.feature_dimensions.items()
+        }
 
-        # self.register_buffer("fallback_text", fallback_text)
-        # self.register_buffer("fallback_image", fallback_image)
-
+    @torch.no_grad()
     def build_cache(self, batch_size=128, verbose=True, debug=False):
         if self.is_trainable:
             return
 
-        with torch.no_grad():
-            item_ids = list(sorted(self.item_dataset.items.keys()))
-            if debug:
-                item_ids = item_ids[:100]  # デバッグ用に最初の100アイテムだけ処理
-            iterator = range(0, len(item_ids), batch_size)
-            if verbose:
-                print(f"Building feature cache for {len(item_ids)} items...")
-                iterator = tqdm(iterator)
-            for idx in iterator:
-                ids = item_ids[idx:idx+batch_size]
-                batch_items = [self.item_dataset.items[i] for i in ids]
-                features = super().forward(batch_items)
-                for item_id, text_feat, img_feat in zip(ids, features["text_features"], features["image_features"]):
-                    self.feature_cache[item_id] = {
-                        "text_features": text_feat.detach().cpu(),
-                        "image_features": img_feat.detach().cpu(),
-                    }
-        
+        item_ids = list(sorted(self.item_dataset.items.keys()))
+        if debug:
+            item_ids = item_ids[:100]
+            
+        iterator = range(0, len(item_ids), batch_size)
+        if verbose:
+            print(f"Building feature cache for {len(item_ids)} items...")
+            iterator = tqdm(iterator)
+            
+        for idx in iterator:
+            ids = item_ids[idx:idx+batch_size]
+            batch_items = [self.item_dataset.items[i] for i in ids]
+            features_batch = self.extractor(batch_items)
+            
+            # キー（text_features等）ごとにキャッシュを展開
+            for i, item_id in enumerate(ids):
+                self.feature_cache[item_id] = {
+                    k: v[i].detach().cpu() for k, v in features_batch.items()
+                }
+
     def forward(self, item_ids: Union[List[int], torch.Tensor], device=None):
-        text_feats = []
-        image_feats = []
         if isinstance(item_ids, list):
             original_shape = (len(item_ids),)
         else:
             original_shape = item_ids.shape
-            item_ids = item_ids.view(-1).tolist()  # Flatten to 1D
+            item_ids = item_ids.view(-1).tolist()
+            
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
 
         if self.is_trainable:
-            items =[self.item_dataset.get_item(item_id) for item_id in item_ids]
-            features = super().forward(items)
-            text_feats = features["text_features"].view(*original_shape, -1)
-            image_feats = features["image_features"].view(*original_shape, -1)
+            items = [self.item_dataset.get_item(item_id) for item_id in item_ids]
+            features = self.extractor(items)
+            return {k: v.view(*original_shape, -1) for k, v in features.items()}
         else:
+            output_features = {k: [] for k in self.feature_dimensions.keys()}
+            
             for item_id in item_ids:
                 if item_id in self.feature_cache:
-                    text_feats.append(self.feature_cache[item_id]["text_features"])
-                    image_feats.append(self.feature_cache[item_id]["image_features"])
+                    for k in output_features:
+                        output_features[k].append(self.feature_cache[item_id][k])
                 else:
-                    text_feats.append(self.fallback_text)
-                    image_feats.append(self.fallback_image)
-            if device is None:
-                device = next(self.parameters()).device
-            text_feats = torch.stack(text_feats).to(device).view(*original_shape, -1)
-            image_feats = torch.stack(image_feats).to(device).view(*original_shape, -1)
-        
-        return {"text_features": text_feats, "image_features": image_feats}
-
+                    for k in output_features:
+                        output_features[k].append(self.fallbacks[k])
+            
+            return {k: torch.stack(v).to(device).view(*original_shape, -1) 
+                    for k, v in output_features.items()}
     
-if __name__ == "__main__":
-    from seqrec.dataset import create_datasets
+    def feature_dims(self) -> Dict[str, int]:
+        return self.feature_dimensions
 
-    categories = ['toys', 'sports', 'beauty']
-
-    for category in categories:
-        dataset_path = f"dataset/{category}"
-        datasets, item_dataset = create_datasets(dataset_path)
-
-        # feature_extractor = ItemFeatureExtractor().to("cuda")
-        # item = [item_dataset.items[1], item_dataset.items[2]]  # 最初のアイテムを取得
-        # features = feature_extractor(item)
-        # print(f"Features for first item in {category}:")
-        # print(f"Text Features Shape: {features['text_features'].shape}")
-        # print(f"Image Features Shape: {features['image_features'].shape}")
-
-        feature_store = ItemFeatureStore(item_dataset).to("cuda")
-        feature_store.build_cache(batch_size=64, debug=True)  # キャッシュ構築（GPUで実行）
-        item_ids = list(item_dataset.items.keys())[:5]  # 最初の5アイテムのIDを取得
-        features = feature_store(item_ids)
-        print(f"Text features for first 5 items in {category}: {features['text_features'].shape}")
-        print(f"Image features for first 5 items in {category}: {features['image_features'].shape}")
+def initialize_item_feature_store(
+    item_dataset: ItemDataset,
+    text_model_name: Optional[str] = None, 
+    image_model_name: Optional[str] = None,
+    is_trainable: bool = False,
+    device: Optional[torch.device] = None
+) -> ItemFeatureStore:
+    """
+    指定されたモデル名に基づいてエンコーダと抽出器を動的に構築し、
+    ItemFeatureStoreを初期化して返すヘルパー関数。
+    """
+    extractors = {}
+    
+    # 1. テキストモデルの構築
+    if text_model_name:
+        text_encoder = SentenceTransformerEncoder(model_name=text_model_name)
+        # feature_keyを明示的に指定（ここでは互換性のため "text_features"）
+        extractors["text"] = TextFeatureExtractor(text_encoder, feature_key="text_features")
+        
+    # 2. 画像モデルの構築
+    if image_model_name:
+        image_encoder = ViTImageEncoder(model_name=image_model_name)
+        # feature_keyを明示的に指定（ここでは互換性のため "image_features"）
+        extractors["image"] = ImageFeatureExtractor(image_encoder, feature_key="image_features")
+        
+    # 3. エラーハンドリング
+    if not extractors:
+        raise ValueError("At least one of text_model_name or image_model_name must be specified.")
+        
+    # 4. 抽出器の合成（1つだけならそれをそのまま使い、複数ならCombinedで束ねる）
+    if len(extractors) == 1:
+        feature_extractor = list(extractors.values())[0]
+    else:
+        feature_extractor = CombinedFeatureExtractor(extractors)
+        
+    # 5. ストアの初期化と返却
+    store = ItemFeatureStore(
+        item_dataset=item_dataset,
+        feature_extractor=feature_extractor,
+        is_trainable=is_trainable
+    )
+    if device is not None:
+        store.to(device)
+    return store
