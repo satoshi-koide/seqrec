@@ -24,7 +24,6 @@ def get_rotation_matrix(u: torch.Tensor, v: torch.Tensor, eps: float = 1e-6) -> 
     B, D = u.shape
     v_b = v.unsqueeze(0).expand(B, D)
     
-    # A = u v^T - v u^T
     uvT = torch.bmm(u.unsqueeze(2), v_b.unsqueeze(1))  # (B, D, D)
     vuT = torch.bmm(v_b.unsqueeze(2), u.unsqueeze(1))  # (B, D, D)
     A = uvT - vuT
@@ -33,18 +32,37 @@ def get_rotation_matrix(u: torch.Tensor, v: torch.Tensor, eps: float = 1e-6) -> 
     dot = torch.sum(u * v_b, dim=-1, keepdim=True).unsqueeze(-1)  # (B, 1, 1)
     
     I = torch.eye(D, device=u.device, dtype=u.dtype).unsqueeze(0).expand(B, D, D)
+    return I + A + A2 / (1 + dot + eps)
+
+def compute_distance(x: torch.Tensor, codes: torch.Tensor, metric: str = "l2") -> torch.Tensor:
+    """
+    距離計算を統合したヘルパー関数。コード選択(B, C)とLoss計算(B, 1)の両方に対応。
+    x: (B, D)
+    codes: (1, C, D) または (B, 1, D)
+    """
+    # 基本の L2 距離の二乗 (MSE)
+    mse_distance = torch.sum((x.unsqueeze(1) - codes) ** 2, dim=-1)
     
-    # ロドリゲスの回転公式（行列版）
-    R = I + A + A2 / (1 + dot + eps)
-    return R
+    if metric == "l2":
+        return mse_distance
+    elif metric == "asymmetric":
+        # 飛び越え & 方向違いを検知する幾何学ペナルティ: ReLU(||c||^2 - x・c)
+        c_sq_norm = torch.sum(codes ** 2, dim=-1)
+        dot_product = torch.sum(x.unsqueeze(1) * codes, dim=-1)
+        penalty = F.relu(c_sq_norm - dot_product)
+        return mse_distance + penalty
+    else:
+        raise ValueError(f"Unknown distance metric: {metric}")
+
 
 class Quantizer(nn.Module):
-    """Layer 1 用の通常の Quantizer (回転なし)"""
-    def __init__(self, code_size: int, embedding_dim: int, beta: float):
+    """通常の Quantizer (回転なし)"""
+    def __init__(self, code_size: int, embedding_dim: int, beta: float, distance_metric: str = "l2"):
         super().__init__()
         self.codes = nn.Parameter(torch.zeros(1, code_size, embedding_dim))
         self.alpha = 0.1
         self.beta = beta
+        self.distance_metric = distance_metric
         self.register_buffer('initialized', torch.tensor(0))
 
     def init_codebooks(self, data: torch.Tensor, prev_q: Optional[torch.Tensor] = None):
@@ -54,7 +72,9 @@ class Quantizer(nn.Module):
             self.initialized.fill_(1)
 
     def forward(self, x: torch.Tensor, prev_q: Optional[torch.Tensor] = None, temperature: float = 0.001):
-        distances = torch.norm(x.unsqueeze(1) - self.codes, dim=-1) / (x.size(1) ** 0.5) / self.alpha
+        # 指定された Metric で距離を計算し、Gumbel用にスケールを調整
+        raw_distances = compute_distance(x, self.codes, metric=self.distance_metric)
+        distances = raw_distances / x.size(1) / self.alpha
 
         if self.training:
             weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
@@ -64,20 +84,22 @@ class Quantizer(nn.Module):
             indices = torch.argmin(distances, dim=-1)
             quantized = self.codes[0, indices, :]
 
-        #loss = torch.mean((x - quantized.detach()) ** 2) + self.beta * torch.mean((quantized - x.detach()) ** 2)
-        loss_commit = torch.mean(torch.sum((x - quantized.detach()) ** 2, dim=-1))
-        loss_codebook = torch.mean(torch.sum((quantized - x.detach()) ** 2, dim=-1))
+        # Loss 計算 (unsqueeze(1) を使うことで codes=(B,1,D) として compute_distance に流し込む)
+        loss_commit = compute_distance(x, quantized.unsqueeze(1).detach(), metric=self.distance_metric).mean()
+        loss_codebook = compute_distance(x.detach(), quantized.unsqueeze(1), metric=self.distance_metric).mean()
         loss = loss_commit + self.beta * loss_codebook
+        
         return QuantizerOutput(quantized=quantized, indices=indices, loss=loss)
 
 
 class RotationalQuantizer(nn.Module):
-    """Layer 2 以降用の 回転ベース Quantizer"""
-    def __init__(self, code_size: int, embedding_dim: int, beta: float):
+    """回転ベースの Quantizer"""
+    def __init__(self, code_size: int, embedding_dim: int, beta: float, distance_metric: str = "l2"):
         super().__init__()
         self.codes = nn.Parameter(torch.zeros(1, code_size, embedding_dim))
         self.alpha = 0.1
         self.beta = beta
+        self.distance_metric = distance_metric
         self.register_buffer('initialized', torch.tensor(0))
         
         v = torch.ones(embedding_dim) / (embedding_dim ** 0.5)
@@ -100,7 +122,10 @@ class RotationalQuantizer(nn.Module):
     def forward(self, x: torch.Tensor, prev_q: torch.Tensor, temperature: float = 0.001):
         R, R_inv = self._get_R_and_R_inv(prev_q)
         x_canonical = torch.bmm(R_inv, x.unsqueeze(2)).squeeze(2)
-        distances = torch.norm(x_canonical.unsqueeze(1) - self.codes, dim=-1) / (x.size(1) ** 0.5) / self.alpha
+        
+        # 正準空間での距離計算
+        raw_distances = compute_distance(x_canonical, self.codes, metric=self.distance_metric)
+        distances = raw_distances / x.size(1) / self.alpha
 
         if self.training:
             weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
@@ -111,11 +136,14 @@ class RotationalQuantizer(nn.Module):
             quantized_canonical = self.codes[0, indices, :]
 
         quantized = torch.bmm(R, quantized_canonical.unsqueeze(2)).squeeze(2)
-        # loss = torch.mean((x - quantized.detach()) ** 2) + self.beta * torch.mean((quantized - x.detach()) ** 2)
-        loss_commit = torch.mean(torch.sum((x - quantized.detach()) ** 2, dim=-1))
-        loss_codebook = torch.mean(torch.sum((quantized - x.detach()) ** 2, dim=-1))
+        
+        # Loss 計算 (元の空間で計算。※幾何学距離は回転不変なため元空間でも結果は同じ)
+        loss_commit = compute_distance(x, quantized.unsqueeze(1).detach(), metric=self.distance_metric).mean()
+        loss_codebook = compute_distance(x.detach(), quantized.unsqueeze(1), metric=self.distance_metric).mean()
         loss = loss_commit + self.beta * loss_codebook
+        
         return QuantizerOutput(quantized=quantized, indices=indices, loss=loss)
+
 
 @dataclass
 class ResidualQuantizerOutput:
@@ -125,14 +153,24 @@ class ResidualQuantizerOutput:
     layer_losses: List[torch.Tensor]
 
 class ResidualQuantizer(nn.Module):
-    def __init__(self, code_sizes: List[int], embedding_dim: int, beta=0.25):
+    def __init__(
+        self, 
+        code_sizes: List[int], 
+        embedding_dim: int, 
+        beta: float = 0.25,
+        use_rotation: bool = True,
+        distance_metric: str = "l2"
+    ):
         super().__init__()
         self.codebooks = nn.ModuleList()
+        self.use_rotation = use_rotation
+        
         for i, code_size in enumerate(code_sizes):
-            if i == 0:
-                self.codebooks.append(Quantizer(code_size, embedding_dim, beta))
+            # i == 0 の場合、または回転を使わない設定の場合は通常の Quantizer を使用
+            if i == 0 or not self.use_rotation:
+                self.codebooks.append(Quantizer(code_size, embedding_dim, beta, distance_metric))
             else:
-                self.codebooks.append(RotationalQuantizer(code_size, embedding_dim, beta))
+                self.codebooks.append(RotationalQuantizer(code_size, embedding_dim, beta, distance_metric))
 
     @torch.no_grad()
     def init_codebooks(self, data: torch.Tensor):
@@ -140,8 +178,7 @@ class ResidualQuantizer(nn.Module):
         prev_q = torch.zeros_like(data)
         
         for i, codebook in enumerate(self.codebooks):
-            # [修正] Layer 1 と Layer 2 以降で呼び出し方を明確に分岐
-            if i == 0:
+            if i == 0 or not self.use_rotation:
                 codebook.init_codebooks(residual)
                 codebook.eval()
                 output = codebook(residual, temperature=0.001)
@@ -162,8 +199,7 @@ class ResidualQuantizer(nn.Module):
         residual = x.clone()
 
         for i, codebook in enumerate(self.codebooks):
-            # [修正] Layer 1 と Layer 2 以降で呼び出し方を明確に分岐
-            if i == 0:
+            if i == 0 or not self.use_rotation:
                 output = codebook(residual, temperature=temperature)
             else:
                 output = codebook(residual, prev_q=z, temperature=temperature)
@@ -186,15 +222,32 @@ class RQVAEOutput(ModelOutput):
     recon_loss: Optional[torch.FloatTensor] = None
     layer_losses: Optional[List[torch.FloatTensor]] = None
     indices: Optional[torch.LongTensor] = None
-    # quantized: Optional[torch.FloatTensor] = None
-    # indices: Optional[List[torch.LongTensor]] = None
 
 class RQVAE(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: List[int], code_sizes: List[int], beta=0.25):
+    def __init__(
+        self, 
+        input_dim: int, 
+        hidden_dims: List[int], 
+        code_sizes: List[int], 
+        beta: float = 0.25,
+        use_rotation: bool = True,           # トップレベルから切り替え可能に
+        distance_metric: str = "asymmetric"  # "l2" or "asymmetric"
+    ):
+        '''
+        RQVAE のコンストラクタ。回転の有無や距離計算の種類もここで指定できるようにする。
+        use_rotation = False & distance_metric = "l2" の組み合わせが、従来の Residual Quantizer と同等
+        '''
         super().__init__()
         self.encoder = MLP(input_dim=input_dim, hidden_dims=hidden_dims, out_dim=hidden_dims[-1])
-        # ※ ResidualQuantizer は前のステップで実装したものを想定
-        self.quantizer = ResidualQuantizer(code_sizes, hidden_dims[-1], beta)
+        
+        # フラグをそのまま下層へパススルー
+        self.quantizer = ResidualQuantizer(
+            code_sizes=code_sizes, 
+            embedding_dim=hidden_dims[-1], 
+            beta=beta,
+            use_rotation=use_rotation,
+            distance_metric=distance_metric
+        )
         self.decoder = MLP(input_dim=hidden_dims[-1], hidden_dims=list(reversed(hidden_dims)), out_dim=input_dim)
 
     def forward(
@@ -213,7 +266,7 @@ class RQVAE(nn.Module):
         total_loss = quantizer_output.loss + recon_loss
 
         return RQVAEOutput(
-            loss=total_loss, # HF Trainer はこの `loss` を見て逆伝播します
+            loss=total_loss, 
             reconstructed=reconstructed,
             recon_loss=recon_loss,
             layer_losses=quantizer_output.layer_losses,

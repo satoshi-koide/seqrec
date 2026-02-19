@@ -68,8 +68,8 @@ class RQVAETrainer(Trainer):
         # 受け取った追加引数 (start_time など) もそのまま親クラスに渡す
         super().log(logs, *args, **kwargs)
 
-def main(dataset_path: str):
 
+def main(dataset_path: str):
     device = 'cuda'
 
     item_dataset = ItemDataset({item.item_id: item for item in load_data(dataset_path, data_size=100000)})
