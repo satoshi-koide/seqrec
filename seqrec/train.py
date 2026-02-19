@@ -172,4 +172,5 @@ if __name__ == "__main__":
     for category in categories:
         print(f"=== Training on {category} category ===")
         dataset_path = f"dataset/{category}"
-        main(dataset_path, feature_extractor="trainable")
+        #main(dataset_path, feature_extractor="trainable")
+        main(dataset_path, feature_extractor="frozen")

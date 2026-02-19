@@ -136,20 +136,36 @@ class ItemDataset(Dataset):
     def __init__(self, items: Dict[Any, Item]):
         self.items = items
         self.asin_to_id = {item.asin: item.item_id for item in items.values()}
+        self.idx_to_id = [item_id for idx, item_id in enumerate(self.items.keys())]
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        if idx in self.items:
-            return self.items[idx]
-        return None
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for ItemDataset of size {len(self)}")
+        item_id = self.idx_to_id[idx]
+        return self.items[item_id]
+    
+    def get_item(self, item_id: int) -> Optional[Item]:
+        return self.items.get(item_id, None)
 
     def get_item_by_asin(self, asin: str) -> Optional[Item]:
         item_id = self.asin_to_id.get(asin)
-        if item_id is not None:
-            return self[item_id]
-        return None
+        return self.get_item(item_id)
+
+class ItemDatasetCollator:
+    def __init__(self, feature_extractor):
+        self.feature_extractor = feature_extractor
+
+    def __call__(self, batch):
+        # batch: List[Item]
+        items = [item for item in batch if item is not None]
+        item_ids = torch.tensor([item.item_id for item in items], dtype=torch.long)
+        features = self.feature_extractor(item_ids, device='cpu')["text_features"]
+        
+        # ここで features は dict {"text_features": Tensor, "image_features": Tensor} の形で返ってくる想定
+        return {"features": features}
 
 def load_missing_ids(file_path, datamaps):
     missing_image_ids = set()

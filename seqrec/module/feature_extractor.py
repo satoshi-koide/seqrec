@@ -79,37 +79,43 @@ class ItemFeatureExtractor(nn.Module):
         # 1. Text Feature Extraction
         # -------------------------------------------------------
         # SentenceTransformerの tokenize -> forward を手動で行い、勾配計算の道を残す
-        valid_index = [i for i, t in enumerate(texts) if t is not None]
-        text_features = torch.zeros((len(items), self.feature_dims()["text_feature_dim"]), device=device)
-        if self.text_model and valid_index:
-            valid_texts = [texts[i] for i in valid_index]
-            text_inputs = self.text_model.tokenize(valid_texts)
-            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-            
-            text_outputs = self.text_model(text_inputs)
-            text_features[valid_index] = text_outputs['sentence_embedding']
+        if self.text_model:
+            valid_index = [i for i, t in enumerate(texts) if t is not None]
+            text_features = torch.zeros((len(items), self.feature_dims()["text_feature_dim"]), device=device)
+            if self.text_model and valid_index:
+                valid_texts = [texts[i] for i in valid_index]
+                text_inputs = self.text_model.tokenize(valid_texts)
+                text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+                
+                text_outputs = self.text_model(text_inputs)
+                text_features[valid_index] = text_outputs['sentence_embedding']
+        else:
+            text_features = torch.zeros((len(items), 0), device=device)  # テキスト特徴がない場合は空のテンソル
 
         # -------------------------------------------------------
         # 2. Image Feature Extraction
         # -------------------------------------------------------
-        pil_images = self._load_images(img_paths)
+        if self.img_model:
+            pil_images = self._load_images(img_paths)
 
-        # pil_images 内の None を missing_image_embedding で置き換えるためのマスク
-        if self.img_processor and self.img_model:
-            valid_images = [img for img in pil_images if img is not None]
-            valid_index = [i for i, img in enumerate(pil_images) if img is not None]
-        
-        img_inputs = self.img_processor(images=valid_images, return_tensors="pt") # これは何度も呼ばれている。キャッシュできるかも。ただ data augmentation で毎回違う画像を入れる可能性もあるので要検討。
-        img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
-        
-        img_outputs = self.img_model(**img_inputs)
-        
-        # Using ViT [CLS] token (index 0)
-        # last_hidden_state: (batch, seq_len, hidden_size)
-        valid_image_features = img_outputs.last_hidden_state[:, 0, :]
+            # pil_images 内の None を missing_image_embedding で置き換えるためのマスク
+            if self.img_processor and self.img_model:
+                valid_images = [img for img in pil_images if img is not None]
+                valid_index = [i for i, img in enumerate(pil_images) if img is not None]
+            
+            img_inputs = self.img_processor(images=valid_images, return_tensors="pt") # これは何度も呼ばれている。キャッシュできるかも。ただ data augmentation で毎回違う画像を入れる可能性もあるので要検討。
+            img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
+            
+            img_outputs = self.img_model(**img_inputs)
+            
+            # Using ViT [CLS] token (index 0)
+            # last_hidden_state: (batch, seq_len, hidden_size)
+            valid_image_features = img_outputs.last_hidden_state[:, 0, :]
 
-        # None だった画像の特徴を missing_image_embedding に置き換える
-        image_features = torch.stack([self.missing_image_embedding if img is None else valid_image_features[valid_index.index(i)] for i, img in enumerate(pil_images)], dim=0).to(device)
+            # None だった画像の特徴を missing_image_embedding に置き換える
+            image_features = torch.stack([self.missing_image_embedding if img is None else valid_image_features[valid_index.index(i)] for i, img in enumerate(pil_images)], dim=0).to(device)
+        else:
+            image_features = torch.zeros((len(items), 0), device=device)  # 画像特徴がない場合は空のテンソル
 
         return {"text_features": text_features, "image_features": image_features}
 
@@ -128,10 +134,12 @@ class ItemFeatureStore(ItemFeatureExtractor):
 
         if not self.is_trainable:
             # set requires_grad to False for all parameters
-            for param in self.text_model.parameters():
-                param.requires_grad = False
-            for param in self.img_model.parameters():
-                param.requires_grad = False
+            if self.text_model:
+                for param in self.text_model.parameters():
+                    param.requires_grad = False
+            if self.img_model:
+                for param in self.img_model.parameters():
+                    param.requires_grad = False
 
         self.feature_cache = {}
 
@@ -160,7 +168,7 @@ class ItemFeatureStore(ItemFeatureExtractor):
                         "image_features": img_feat.detach().cpu(),
                     }
         
-    def forward(self, item_ids: Union[List[int], torch.Tensor]):
+    def forward(self, item_ids: Union[List[int], torch.Tensor], device=None):
         text_feats = []
         image_feats = []
         if isinstance(item_ids, list):
@@ -170,7 +178,7 @@ class ItemFeatureStore(ItemFeatureExtractor):
             item_ids = item_ids.view(-1).tolist()  # Flatten to 1D
 
         if self.is_trainable:
-            items =[self.item_dataset[item_id] for item_id in item_ids]
+            items =[self.item_dataset.get_item(item_id) for item_id in item_ids]
             features = super().forward(items)
             text_feats = features["text_features"].view(*original_shape, -1)
             image_feats = features["image_features"].view(*original_shape, -1)
@@ -182,8 +190,10 @@ class ItemFeatureStore(ItemFeatureExtractor):
                 else:
                     text_feats.append(self.fallback_text)
                     image_feats.append(self.fallback_image)
-            text_feats = torch.stack(text_feats).to(next(self.parameters()).device).view(*original_shape, -1)
-            image_feats = torch.stack(image_feats).to(next(self.parameters()).device).view(*original_shape, -1)
+            if device is None:
+                device = next(self.parameters()).device
+            text_feats = torch.stack(text_feats).to(device).view(*original_shape, -1)
+            image_feats = torch.stack(image_feats).to(device).view(*original_shape, -1)
         
         return {"text_features": text_feats, "image_features": image_feats}
 
