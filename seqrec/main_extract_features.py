@@ -5,7 +5,7 @@ import gzip
 from typing import Dict
 
 from seqrec.dataset import Item, ItemDataset
-from seqrec.module.feature_extractor import initialize_item_feature_store
+from seqrec.module.feature_extractor import initialize_feature_extractor
 
 def load_data(dataset_path: str, data_size=None):
     for item_id, line in enumerate(gzip.open(dataset_path + '/meta.json.gz', 'rt')):
@@ -30,19 +30,20 @@ def extract(dataset_path: str, mode: str, model_name: str):
 
     print(f"Mode: {mode}, Model: {model_name}")
 
+    item_dataset = list(load_data(dataset_path))
+    output_path = {}
     if mode == 'image':
-        item_dataset = ItemDataset({item.item_id: item for item in load_data(dataset_path)})
         print(f"Loaded {len(item_dataset)} items.")
-        feature_extractor = initialize_item_feature_store(item_dataset, image_model_name=model_name, device=device)
+        feature_extractor = initialize_feature_extractor(image_model_name=model_name, device=device)
+        output_path['image_features'] = f'{dataset_path}/feature_cache_image_{model_name.replace("/", "_")}'
     elif mode == 'text':
-        item_dataset = ItemDataset({item.item_id: item for item in load_data(dataset_path)})
         print(f"Loaded {len(item_dataset)} items.")
-        feature_extractor = initialize_item_feature_store(item_dataset, text_model_name=model_name, device=device) 
+        feature_extractor = initialize_feature_extractor(text_model_name=model_name, device=device) 
+        output_path['text_features'] = f'{dataset_path}/feature_cache_text_{model_name.replace("/", "_")}'
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    feature_extractor.build_cache(batch_size=512, verbose=True)
-    feature_extractor.save_cache(f'{dataset_path}/feature_cache_{mode}_{model_name.replace("/", "_")}', key=f'{mode}_features')
+    feature_extractor.build_cache(item_dataset, batch_size=512, verbose=True, save_to=output_path)
 
 def main():
     import argparse

@@ -135,7 +135,7 @@ class AbstractItemFeatureExtractor(nn.Module, abc.ABC):
         pass
 
     @torch.no_grad()
-    def build_cache(self, items: List[Item], batch_size: int = 128, save_to: str = None, verbose: bool = True, debug: bool = False) -> Dict[int, Dict[str, torch.Tensor]]:
+    def build_cache(self, items: List[Item], batch_size: int = 128, save_to: Dict[str, str] = None, verbose: bool = True, debug: bool = False) -> Dict[int, Dict[str, torch.Tensor]]:
         """
         List[Item] から特徴量を一括抽出し、アイテムIDをキーとしたキャッシュ辞書を作成する。
         """
@@ -360,7 +360,8 @@ class TrainableItemFeatureStore(AbstractItemFeatureStore):
 
 def initialize_feature_extractor(
     text_model_name: Optional[str] = None, 
-    image_model_name: Optional[str] = None
+    image_model_name: Optional[str] = None,
+    device: Optional[torch.device] = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> AbstractItemFeatureExtractor:
     """
     指定されたモデル名に基づいてエンコーダと抽出器を動的に構築するヘルパー。
@@ -394,6 +395,6 @@ def initialize_feature_extractor(
         raise ValueError("At least one of text_model_name or image_model_name must be specified.")
         
     if len(extractors) == 1:
-        return list(extractors.values())[0]
+        return list(extractors.values())[0].to(device)
     else:
-        return CombinedFeatureExtractor(extractors)
+        return CombinedFeatureExtractor(extractors).to(device)
