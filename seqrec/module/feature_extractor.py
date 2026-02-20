@@ -4,6 +4,7 @@ from PIL import Image
 from seqrec.dataset import Item, ItemDataset
 from tqdm import tqdm
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -87,6 +88,49 @@ class ViTImageEncoder(AbstractImageEncoder):
                 
         return features
 
+class SiglipImageEncoder(AbstractImageEncoder):
+    def __init__(self, model_name: str = 'google/siglip-base-patch16-224'):
+        super().__init__()
+        from transformers import AutoProcessor, SiglipVisionModel
+        from seqrec.utils import get_optimal_attention_config
+        
+        attn_config = get_optimal_attention_config()
+        # SigLIP用のプロセッサとビジョンモデルを読み込む
+        self.processor = AutoProcessor.from_pretrained(model_name, **attn_config)
+        self.model = SiglipVisionModel.from_pretrained(model_name)
+        
+        # デバイス混在エラーを避けるため、nn.Parameterやregister_bufferは使わず、
+        # 明示的にCPU上のゼロテンソルとして保持しておく
+        self.missing_image_fallback = torch.zeros(self.model.config.hidden_size)
+
+    def get_output_dim(self) -> int:
+        return self.model.config.hidden_size
+
+    def forward(self, images: List[Optional[Image.Image]]) -> torch.Tensor:
+        device = next(self.parameters()).device
+        batch_size = len(images)
+        
+        valid_images = [img for img in images if img is not None]
+        valid_indices = [i for i, img in enumerate(images) if img is not None]
+
+        # フォールバック用テンソル（CPU）をベースにバッチを作成し、後から目的のデバイスに転送
+        features = torch.stack([self.missing_image_fallback] * batch_size).to(device)
+
+        if valid_images:
+            inputs = self.processor(images=valid_images, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # 推論
+            outputs = self.model(**inputs)
+            
+            # [重要] CLSトークン([:, 0, :])ではなく、pooler_outputを使用する
+            valid_features = outputs.pooler_output
+            
+            # 有効な画像の特徴量を元のインデックスに配置
+            for valid_idx, feature in zip(valid_indices, valid_features):
+                features[valid_idx] = feature
+                
+        return features
 
 # ==========================================
 # 2. Feature Extractors (モダリティの分離)
@@ -220,6 +264,18 @@ class ItemFeatureStore(nn.Module):
                     k: v[i].detach().cpu() for k, v in features_batch.items()
                 }
 
+    def load_cache(self, path: str):
+        data = np.load(path)
+        for item_id in self.item_dataset.items.keys():
+            self.feature_cache[item_id] = {
+                k: torch.tensor(data[str(k)][item_id]) for k in self.feature_dimensions.keys()
+            }
+
+    def save_cache(self, path: str, key: str):
+        # numpy の行列形式に変換して保存。item_id の配列も保存する。
+        np.savez_compressed(path, **{str(k): np.array([v[key].cpu().numpy() for v in self.feature_cache.values()]) 
+                                     for k in self.feature_dimensions.keys()})
+
     def forward(self, item_ids: Union[List[int], torch.Tensor], device=None):
         if isinstance(item_ids, list):
             original_shape = (len(item_ids),)
@@ -265,18 +321,30 @@ def initialize_item_feature_store(
     指定されたモデル名に基づいてエンコーダと抽出器を動的に構築し、
     ItemFeatureStoreを初期化して返すヘルパー関数。
     """
+    image_model_name_to_extractor = {
+        'google/siglip-base-patch16-224': SiglipImageEncoder,
+        'google/vit-base-patch16-224-in21k': ViTImageEncoder
+    }
+    text_model_name_to_extractor = {
+        'all-mpnet-base-v2': SentenceTransformerEncoder,
+        'all-MiniLM-L6-v2': SentenceTransformerEncoder,
+        'all-MiniLM-L12-v2': SentenceTransformerEncoder,
+    }
+
     extractors = {}
     
     # 1. テキストモデルの構築
     if text_model_name:
-        text_encoder = SentenceTransformerEncoder(model_name=text_model_name)
-        # feature_keyを明示的に指定（ここでは互換性のため "text_features"）
+        if text_model_name not in text_model_name_to_extractor:
+            raise ValueError(f"Unsupported text model: {text_model_name}")
+        text_encoder = text_model_name_to_extractor[text_model_name](model_name=text_model_name)
         extractors["text"] = TextFeatureExtractor(text_encoder, feature_key="text_features")
         
     # 2. 画像モデルの構築
     if image_model_name:
-        image_encoder = ViTImageEncoder(model_name=image_model_name)
-        # feature_keyを明示的に指定（ここでは互換性のため "image_features"）
+        if image_model_name not in image_model_name_to_extractor:
+            raise ValueError(f"Unsupported image model: {image_model_name}")
+        image_encoder = image_model_name_to_extractor[image_model_name](model_name=image_model_name)
         extractors["image"] = ImageFeatureExtractor(image_encoder, feature_key="image_features")
         
     # 3. エラーハンドリング
