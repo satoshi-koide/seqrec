@@ -176,7 +176,8 @@ def main(dataset_path: str, feature_extractor: str = 'none', text_model_name: st
 if __name__ == "__main__":
     categories = ['toys', 'sports', 'beauty']
 
-    text_model_name=None
+    #text_model_name=None
+    text_model_name="all-mpnet-base-v2"
     for category in categories:
         for image_model_name in ["google/vit-base-patch16-224-in21k", None]:
             print(f"=== Training on {category} category ===")
