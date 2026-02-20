@@ -38,7 +38,10 @@ class SentenceTransformerEncoder(AbstractTextEncoder):
     def __init__(self, model_name: str = 'all-mpnet-base-v2'):
         super().__init__()
         from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(model_name)
+        from seqrec.utils import get_optimal_attention_config
+        
+        attn_config = get_optimal_attention_config()
+        self.model = SentenceTransformer(model_name, model_kwargs=attn_config)
 
     def get_output_dim(self) -> int:
         return self.model.get_sentence_embedding_dimension()
@@ -59,8 +62,8 @@ class ViTImageEncoder(AbstractImageEncoder):
         from seqrec.utils import get_optimal_attention_config
         
         attn_config = get_optimal_attention_config()
-        self.processor = ViTImageProcessor.from_pretrained(model_name, **attn_config)
-        self.model = ViTModel.from_pretrained(model_name)
+        self.processor = ViTImageProcessor.from_pretrained(model_name)
+        self.model = ViTModel.from_pretrained(model_name, **attn_config)
         self.missing_image_embedding = nn.Parameter(torch.zeros(self.model.config.hidden_size))
 
     def get_output_dim(self) -> int:
@@ -91,13 +94,13 @@ class ViTImageEncoder(AbstractImageEncoder):
 class SiglipImageEncoder(AbstractImageEncoder):
     def __init__(self, model_name: str = 'google/siglip-base-patch16-224'):
         super().__init__()
-        from transformers import AutoProcessor, SiglipVisionModel
+        from transformers import SiglipImageProcessor, SiglipVisionModel
         from seqrec.utils import get_optimal_attention_config
         
         attn_config = get_optimal_attention_config()
         # SigLIP用のプロセッサとビジョンモデルを読み込む
-        self.processor = AutoProcessor.from_pretrained(model_name, **attn_config)
-        self.model = SiglipVisionModel.from_pretrained(model_name)
+        self.processor = SiglipImageProcessor.from_pretrained(model_name)
+        self.model = SiglipVisionModel.from_pretrained(model_name, **attn_config)
         
         # デバイス混在エラーを避けるため、nn.Parameterやregister_bufferは使わず、
         # 明示的にCPU上のゼロテンソルとして保持しておく
@@ -326,6 +329,7 @@ def initialize_item_feature_store(
         'google/vit-base-patch16-224-in21k': ViTImageEncoder
     }
     text_model_name_to_extractor = {
+        'BAAI/bge-base-en-v1.5': SentenceTransformerEncoder,
         'all-mpnet-base-v2': SentenceTransformerEncoder,
         'all-MiniLM-L6-v2': SentenceTransformerEncoder,
         'all-MiniLM-L12-v2': SentenceTransformerEncoder,
