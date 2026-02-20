@@ -5,7 +5,7 @@ import gzip
 from typing import Dict
 
 from seqrec.dataset import Item, ItemDataset
-from seqrec.module.feature_extractor import initialize_feature_extractor
+from seqrec.module.feature_extractor import initialize_feature_extractor, CachedItemFeatureStore
 
 def load_data(dataset_path: str, data_size=None):
     for item_id, line in enumerate(gzip.open(dataset_path + '/meta.json.gz', 'rt')):
@@ -54,6 +54,18 @@ def main():
     args = parser.parse_args()
 
     extract(args.dataset_path, args.mode, args.model_name)
+
+    # test loading the cache
+    npz_path = {
+        f'{args.mode}_features': f'{args.dataset_path}/feature_cache_{args.mode}_{args.model_name.replace("/", "_")}.npz'
+    }
+    feature_store = CachedItemFeatureStore(npz_path)
+    print(f"Loaded features for {len(feature_store)} items.")
+    # # First 3 examples
+    # for i, (item_id, features) in enumerate(feature_store.cache.items()):
+    #     if i >= 3:
+    #         break
+    #     print(f"Item ID: {item_id}, Features: {features[i]}")
 
 if __name__ == "__main__":
     main()

@@ -17,11 +17,14 @@ class QuantizerOutput:
     loss: torch.Tensor
 
 class Quantizer(nn.Module):
-    def __init__(self, code_size: int, embedding_dim: int, beta: float):
+    def __init__(self, code_size: int, embedding_dim: int, beta: float, forward_mode: str):
         super().__init__()
         self.codes = nn.Parameter(torch.zeros(1, code_size, embedding_dim))
         self.alpha = 0.1
         self.beta = beta
+        self.forward_mode = forward_mode
+        if forward_mode not in ['gumbel', 'STE']:
+            raise ValueError(f"Invalid forward_mode: {forward_mode}. Must be 'gumbel' or 'STE'.")
         self.register_buffer('initialized', torch.tensor(0))
 
     def init_codebooks(self, data: torch.Tensor):
@@ -53,10 +56,16 @@ class Quantizer(nn.Module):
         distances = torch.norm(x.unsqueeze(1) - self.codes, dim=-1) / (x.size(1) ** 0.5) / self.alpha # (B, C)
 
         if self.training:
-            # Gummbel Softmax for differentiable codebook selection
-            weights = torch.nn.functional.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)  # (B, C)
-            quantized = torch.einsum('bc,bcd->bd', weights, self.codes)  # (B, D)
-            indices = None
+            if self.forward_mode == 'gumbel':
+                # Gummbel Softmax for differentiable codebook selection
+                weights = torch.nn.functional.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)  # (B, C)
+                quantized = torch.einsum('bc,bcd->bd', weights, self.codes)  # (B, D)
+                indices = None
+            else:
+                # Straight-Through Estimator (STE)
+                indices = torch.argmin(distances, dim=-1)  # (B,)
+                quantized = self.codes[0, indices, :]  # (B, D)
+                quantized = x + (quantized - x).detach()  # STE trick
         else:
             # Get nearest codebook entry
             indices = torch.argmin(distances, dim=-1)  # (B,)
@@ -77,9 +86,9 @@ class ResidualQuantizerOutput:
 
 
 class ResidualQuantizer(nn.Module):
-    def __init__(self, code_sizes: List[int], embedding_dim: int, beta=0.25):
+    def __init__(self, code_sizes: List[int], embedding_dim: int, beta=0.25, forward_mode='STE'):
         super().__init__()
-        self.codebooks = nn.ModuleList([Quantizer(code_size, embedding_dim, beta) for code_size in code_sizes])
+        self.codebooks = nn.ModuleList([Quantizer(code_size, embedding_dim, beta, forward_mode) for code_size in code_sizes])
 
     @torch.no_grad()
     def init_codebooks(self, data: torch.Tensor):
@@ -131,11 +140,11 @@ class RQVAEOutput(ModelOutput):
     # indices: Optional[List[torch.LongTensor]] = None
 
 class RQVAE(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: List[int], code_sizes: List[int], beta=0.25):
+    def __init__(self, input_dim: int, hidden_dims: List[int], code_sizes: List[int], beta=0.25, forward_mode='STE'):
         super().__init__()
         self.encoder = MLP(input_dim=input_dim, hidden_dims=hidden_dims, out_dim=hidden_dims[-1])
         # ※ ResidualQuantizer は前のステップで実装したものを想定
-        self.quantizer = ResidualQuantizer(code_sizes, hidden_dims[-1], beta)
+        self.quantizer = ResidualQuantizer(code_sizes, hidden_dims[-1], beta, forward_mode)
         self.decoder = MLP(input_dim=hidden_dims[-1], hidden_dims=list(reversed(hidden_dims)), out_dim=input_dim)
 
     def forward(
