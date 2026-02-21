@@ -162,9 +162,10 @@ class ItemDatasetCollator:
         # batch: List[Item]
         items = [item for item in batch if item is not None]
         item_ids = torch.tensor([item.item_id for item in items], dtype=torch.long)
-        features = self.feature_extractor(item_ids, device='cpu')["text_features"]
-        
+        features = self.feature_extractor(item_ids, device='cpu')
         # ここで features は dict {"text_features": Tensor, "image_features": Tensor} の形で返ってくる想定
+        features = torch.cat([features[key] for key in sorted(features.keys())], dim=-1)  # 例えば (batch_size, total_feature_dim)
+
         return {"features": features}
 
 def load_missing_ids(file_path, datamaps):

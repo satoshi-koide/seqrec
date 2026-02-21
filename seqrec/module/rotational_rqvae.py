@@ -1,13 +1,58 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
 
 # utils.py と mlp.py のインポートは環境に合わせて維持してください
 from .utils import kmeans_init_
 from .mlp import MLP
+
+import math
+from transformers import TrainerCallback
+
+class GumbelTemperatureCallback(TrainerCallback):
+    def __init__(self, tau_init=1.0, tau_min=0.1, decay_ratio=0.7):
+        """
+        decay_ratio: 全学習ステップの何%で tau_min に到達させるか（デフォルト70%）
+        """
+        self.tau_init = tau_init
+        self.tau_min = tau_min
+        self.decay_ratio = decay_ratio
+        self.gamma = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # 学習開始時に、Trainerが計算済みの総ステップ数を取得
+        total_steps = state.max_steps
+        target_step = int(total_steps * self.decay_ratio)
+        
+        if target_step > 0:
+            # tau_min = tau_init * (gamma ^ target_step) を gamma について解く
+            self.gamma = math.exp(math.log(self.tau_min / self.tau_init) / target_step)
+        else:
+            self.gamma = 1.0
+            
+        print(f"[Callback] Gumbel Softmax scheduler initialized. Target step: {target_step}, Gamma: {self.gamma:.6f}")
+
+    def on_step_begin(self, args, state, control, model, **kwargs):
+        # 毎ステップの最初に温度を計算
+        if self.gamma is None:
+            return
+            
+        current_tau = self.tau_init * (self.gamma ** state.global_step)
+        current_tau = max(self.tau_min, current_tau)
+        
+        # モデルの属性を直接書き換える
+        # (DataParallelやDDP環境でラップされている場合を考慮して model.module をチェック)
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        unwrapped_model.tau = current_tau
+
+    # (オプション) Wandb等を使っている場合、ログ記録のタイミングで温度も出力すると分析に便利です
+    def on_log(self, args, state, control, model, logs=None, **kwargs):
+        if logs is not None:
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            logs["gumbel_tau"] = unwrapped_model.tau
 
 @dataclass
 class QuantizerOutput:
@@ -56,13 +101,14 @@ def compute_distance(x: torch.Tensor, codes: torch.Tensor, metric: str = "l2") -
 
 
 class Quantizer(nn.Module):
-    """通常の Quantizer (回転なし)"""
-    def __init__(self, code_size: int, embedding_dim: int, beta: float, distance_metric: str = "l2"):
+    def __init__(self, code_size: int, embedding_dim: int, beta: float, spherical_norm: bool, forward_mode: str = "STE", distance_metric: str = "l2"):
         super().__init__()
         self.codes = nn.Parameter(torch.zeros(1, code_size, embedding_dim))
         self.alpha = 0.1
         self.beta = beta
+        self.forward_mode = forward_mode
         self.distance_metric = distance_metric
+        self.spherical_norm = spherical_norm
         self.register_buffer('initialized', torch.tensor(0))
 
     def init_codebooks(self, data: torch.Tensor, prev_q: Optional[torch.Tensor] = None):
@@ -71,35 +117,49 @@ class Quantizer(nn.Module):
             kmeans_init_(self.codes.data.squeeze(0), data)
             self.initialized.fill_(1)
 
-    def forward(self, x: torch.Tensor, prev_q: Optional[torch.Tensor] = None, temperature: float = 0.001):
+    def forward(self, x: torch.Tensor, prev_q: Optional[torch.Tensor] = None, temperature: float = 1.0) -> QuantizerOutput:
         # 指定された Metric で距離を計算し、Gumbel用にスケールを調整
-        raw_distances = compute_distance(x, self.codes, metric=self.distance_metric)
-        distances = raw_distances / x.size(1) / self.alpha
+        if self.spherical_norm:
+            x = F.normalize(x, p=2, dim=-1)
+            codes_norm = F.normalize(self.codes, p=2, dim=-1)
+            raw_distances = compute_distance(x, codes_norm, metric=self.distance_metric)
+        else:
+            raw_distances = compute_distance(x, self.codes, metric=self.distance_metric)
+        #distances = raw_distances / x.size(1) / self.alpha # これはダメ。かなり一様ランダムになってしまう。
+        distances = raw_distances
 
         if self.training:
-            weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
-            quantized = torch.einsum('bc,bcd->bd', weights, self.codes)
-            indices = torch.argmax(weights, dim=-1)
+            if self.forward_mode == 'gumbel':
+                weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
+                quantized = torch.einsum('bc,bcd->bd', weights, self.codes)
+                quantized_out = quantized
+                indices = torch.argmax(weights, dim=-1)
+            else:  # STE
+                indices = torch.argmin(distances, dim=-1)
+                quantized = self.codes[0, indices, :]
+                quantized_out = x + (quantized - x).detach() # STE trick
         else:
             indices = torch.argmin(distances, dim=-1)
             quantized = self.codes[0, indices, :]
+            quantized_out = quantized
 
         # Loss 計算 (unsqueeze(1) を使うことで codes=(B,1,D) として compute_distance に流し込む)
-        loss_commit = compute_distance(x, quantized.unsqueeze(1).detach(), metric=self.distance_metric).mean()
+        loss_commit = compute_distance(x, quantized.detach().unsqueeze(1), metric=self.distance_metric).mean()
         loss_codebook = compute_distance(x.detach(), quantized.unsqueeze(1), metric=self.distance_metric).mean()
         loss = loss_commit + self.beta * loss_codebook
         
-        return QuantizerOutput(quantized=quantized, indices=indices, loss=loss)
+        return QuantizerOutput(quantized=quantized_out, indices=indices, loss=loss)
 
 
 class RotationalQuantizer(nn.Module):
     """回転ベースの Quantizer"""
-    def __init__(self, code_size: int, embedding_dim: int, beta: float, distance_metric: str = "l2"):
+    def __init__(self, code_size: int, embedding_dim: int, beta: float, forward_mode: str = "STE", distance_metric: str = "l2"):
         super().__init__()
         self.codes = nn.Parameter(torch.zeros(1, code_size, embedding_dim))
         self.alpha = 0.1
         self.beta = beta
         self.distance_metric = distance_metric
+        self.forward_mode = forward_mode
         self.register_buffer('initialized', torch.tensor(0))
         
         v = torch.ones(embedding_dim) / (embedding_dim ** 0.5)
@@ -119,27 +179,35 @@ class RotationalQuantizer(nn.Module):
             kmeans_init_(self.codes.data.squeeze(0), canonical_residual)
             self.initialized.fill_(1)
 
-    def forward(self, x: torch.Tensor, prev_q: torch.Tensor, temperature: float = 0.001):
+    def forward(self, x: torch.Tensor, prev_q: torch.Tensor, temperature: float = 1.0):
         R, R_inv = self._get_R_and_R_inv(prev_q)
         x_canonical = torch.bmm(R_inv, x.unsqueeze(2)).squeeze(2)
         
         # 正準空間での距離計算
         raw_distances = compute_distance(x_canonical, self.codes, metric=self.distance_metric)
-        distances = raw_distances / x.size(1) / self.alpha
+        # distances = raw_distances / x.size(1) / self.alpha # これはダメ。かなり一様ランダムになってしまう。
+        distances = raw_distances
 
         if self.training:
-            weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
-            quantized_canonical = torch.einsum('bc,bcd->bd', weights, self.codes)
-            indices = torch.argmax(weights, dim=-1)
+            if self.forward_mode == 'gumbel':
+                weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
+                quantized_canonical = torch.einsum('bc,bcd->bd', weights, self.codes)
+                quantized_canonical_out = quantized_canonical
+                indices = torch.argmax(weights, dim=-1)
+            else:  # STE
+                indices = torch.argmin(distances, dim=-1)
+                quantized_canonical = self.codes[0, indices, :]
+                quantized_canonical_out = x_canonical + (quantized_canonical - x_canonical).detach()
         else:
             indices = torch.argmin(distances, dim=-1)
             quantized_canonical = self.codes[0, indices, :]
+            quantized_canonical_out = quantized_canonical
 
-        quantized = torch.bmm(R, quantized_canonical.unsqueeze(2)).squeeze(2)
+        quantized = torch.bmm(R, quantized_canonical_out.unsqueeze(2)).squeeze(2)
         
         # Loss 計算 (元の空間で計算。※幾何学距離は回転不変なため元空間でも結果は同じ)
-        loss_commit = compute_distance(x, quantized.unsqueeze(1).detach(), metric=self.distance_metric).mean()
-        loss_codebook = compute_distance(x.detach(), quantized.unsqueeze(1), metric=self.distance_metric).mean()
+        loss_commit = compute_distance(x, quantized_canonical.detach().unsqueeze(1), metric=self.distance_metric).mean()
+        loss_codebook = compute_distance(x.detach(), quantized_canonical.unsqueeze(1), metric=self.distance_metric).mean()
         loss = loss_commit + self.beta * loss_codebook
         
         return QuantizerOutput(quantized=quantized, indices=indices, loss=loss)
@@ -158,19 +226,23 @@ class ResidualQuantizer(nn.Module):
         code_sizes: List[int], 
         embedding_dim: int, 
         beta: float = 0.25,
-        use_rotation: bool = True,
-        distance_metric: str = "l2"
+        spherical_norm: bool = True,
+        forward_mode: str = "STE",
+        distance_metric: str = "l2",
+        use_rotation: bool = False,
     ):
         super().__init__()
         self.codebooks = nn.ModuleList()
         self.use_rotation = use_rotation
+        self.forward_mode = forward_mode
         
         for i, code_size in enumerate(code_sizes):
             # i == 0 の場合、または回転を使わない設定の場合は通常の Quantizer を使用
             if i == 0 or not self.use_rotation:
-                self.codebooks.append(Quantizer(code_size, embedding_dim, beta, distance_metric))
+                spherical_norm = (i == 0) and spherical_norm # 最初の層だけ球面正規化する例
+                self.codebooks.append(Quantizer(code_size, embedding_dim, beta, spherical_norm=spherical_norm, forward_mode=self.forward_mode, distance_metric=distance_metric))
             else:
-                self.codebooks.append(RotationalQuantizer(code_size, embedding_dim, beta, distance_metric))
+                self.codebooks.append(RotationalQuantizer(code_size, embedding_dim, beta, forward_mode=self.forward_mode, distance_metric=distance_metric))
 
     @torch.no_grad()
     def init_codebooks(self, data: torch.Tensor):
@@ -191,12 +263,13 @@ class ResidualQuantizer(nn.Module):
             residual = residual - output.quantized
             prev_q = prev_q + output.quantized
 
-    def forward(self, x: torch.Tensor, temperature: float=0.001) -> ResidualQuantizerOutput:
+    def forward(self, x: torch.Tensor, temperature: float) -> ResidualQuantizerOutput:
         all_indices = []
         layer_losses = []
         z = torch.zeros_like(x)
         total_loss = 0.0
         residual = x.clone()
+        debug_metrics = {}
 
         for i, codebook in enumerate(self.codebooks):
             if i == 0 or not self.use_rotation:
@@ -210,10 +283,9 @@ class ResidualQuantizer(nn.Module):
             all_indices.append(output.indices)
             total_loss += output.loss
             layer_losses.append(output.loss)
-        
+
         indices = torch.stack(all_indices, dim=1)
         return ResidualQuantizerOutput(quantized=z, indices=indices, loss=total_loss, layer_losses=layer_losses)
-
 
 @dataclass
 class RQVAEOutput(ModelOutput):
@@ -222,6 +294,7 @@ class RQVAEOutput(ModelOutput):
     recon_loss: Optional[torch.FloatTensor] = None
     layer_losses: Optional[List[torch.FloatTensor]] = None
     indices: Optional[torch.LongTensor] = None
+    debug_metrics: Optional[Dict[str, float]] = None
 
 class RQVAE(nn.Module):
     def __init__(
@@ -230,48 +303,131 @@ class RQVAE(nn.Module):
         hidden_dims: List[int], 
         code_sizes: List[int], 
         beta: float = 0.25,
+        spherical_norm: bool = True,
+        forward_mode: str = "STE",
         use_rotation: bool = True,           # トップレベルから切り替え可能に
-        distance_metric: str = "asymmetric"  # "l2" or "asymmetric"
+        distance_metric: str = "l2"  # "l2" or "asymmetric"
     ):
         '''
         RQVAE のコンストラクタ。回転の有無や距離計算の種類もここで指定できるようにする。
         use_rotation = False & distance_metric = "l2" の組み合わせが、従来の Residual Quantizer と同等
         '''
         super().__init__()
-        self.encoder = MLP(input_dim=input_dim, hidden_dims=hidden_dims, out_dim=hidden_dims[-1])
         
+        self.tau = 0.1
+        self.is_warmup = False
+        self.forward_mode = forward_mode
+
         # フラグをそのまま下層へパススルー
         self.quantizer = ResidualQuantizer(
             code_sizes=code_sizes, 
             embedding_dim=hidden_dims[-1], 
             beta=beta,
+            forward_mode=forward_mode,
             use_rotation=use_rotation,
             distance_metric=distance_metric
         )
+
+        self.encoder = MLP(input_dim=input_dim, hidden_dims=hidden_dims, out_dim=hidden_dims[-1])
         self.decoder = MLP(input_dim=hidden_dims[-1], hidden_dims=list(reversed(hidden_dims)), out_dim=input_dim)
+
+    def set_warmup_mode(self, mode: bool):
+        """Warm-up（純粋なAE）モードのON/OFFを切り替える"""
+        self.is_warmup = mode
+        if mode:
+            print("[Mode] Switched to Autoencoder Warm-up mode. Quantization is bypassed.")
+        else:
+            print("[Mode] Switched to Full RQ-VAE mode. Quantization is active.")
 
     def forward(
         self, 
         features: torch.Tensor, 
         labels: Optional[torch.Tensor] = None, 
-        temperature: float = 0.001,
         **kwargs
-    ) -> RQVAEOutput:
-        
+    ):
+        normalize = True
         encoded = self.encoder(features)
-        quantizer_output = self.quantizer(encoded, temperature=temperature)
+        #encoded = F.normalize(encoded, p=2, dim=-1) # ここで正規化してもいいですが、Quantizer 内で距離計算前に正規化する方が柔軟性が高いのでそちらに移動しました。
+
+        if normalize:
+            features = F.normalize(features, p=2, dim=-1) # この正規化は怪しい。再構成ベクトルも正規化することになるが、それは向きだけを揃えることを意味する。
+
+        # === 追加: Warm-up モード時は量子化をバイパス ===
+        if getattr(self, "is_warmup", False):
+            reconstructed = self.decoder(encoded)
+            if normalize:
+                reconstructed = F.normalize(reconstructed, p=2, dim=-1) # ここも正規化するなら、features と同様に正規化する必要があります。
+            recon_loss = torch.mean(torch.sum((features - reconstructed) ** 2, dim=-1))
+
+            with torch.no_grad():
+                features_norm = torch.norm(features, dim=-1).mean().item()
+                recon_norm = torch.norm(reconstructed, dim=-1).mean().item()
+                print(f"[Debug] Warm-up mode: recon_loss={recon_loss.item():.4f}, features_norm={features_norm:.4f}, recon_norm={recon_norm:.4f}")
+            
+            return RQVAEOutput(
+                loss=recon_loss, 
+                reconstructed=reconstructed,
+                recon_loss=recon_loss,
+                layer_losses=None,   # Warm-up中はCommitment Lossなし
+                indices=None,        # Warm-up中はIDなし
+                debug_metrics=None   # Warm-up中はデバッグメトリクスなし
+            )
+
+        # 通常の RQ-VAE モード
+        quantizer_output = self.quantizer(encoded, temperature=self.tau)
         reconstructed = self.decoder(quantizer_output.quantized)
-        
+        if normalize:
+            reconstructed = F.normalize(reconstructed, p=2, dim=-1) # ここも正規化するなら、features と同様に正規化する必要があります。
+
         recon_loss = torch.mean(torch.sum((features - reconstructed) ** 2, dim=-1))
         total_loss = quantizer_output.loss + recon_loss
+
+        debug_metrics = self.compute_debug_metrics(encoded, quantizer_output)
 
         return RQVAEOutput(
             loss=total_loss, 
             reconstructed=reconstructed,
             recon_loss=recon_loss,
             layer_losses=quantizer_output.layer_losses,
-            indices=quantizer_output.indices
+            indices=quantizer_output.indices,
+            debug_metrics=debug_metrics
         )
+
+    @torch.no_grad()
+    def compute_debug_metrics(self, encoded: torch.Tensor, quantizer_output: QuantizerOutput) -> Dict[str, float]:
+        z_var = torch.var(encoded, dim=0).mean()
+
+        q_norm = torch.nn.functional.normalize(quantizer_output.quantized, p=2, dim=-1)
+        zq_cos_sim = torch.mean(torch.sum(encoded * q_norm, dim=-1))
+
+        # === 🚀 修正: 生の重みを取得し、必ず F.normalize をかける！ ===
+        cb_weights_raw = self.quantizer.codebooks[0].codes if hasattr(self.quantizer.codebooks[0], 'codes') else self.quantizer.codebooks[0].weight
+        cb_weights_norm = F.normalize(cb_weights_raw, p=2, dim=-1)
+
+        # 1. 球面上の分散（多様性）
+        cb_var_L1 = torch.var(cb_weights_norm).mean() # 正規化後の分散
+
+        # 2. Gumbel Match Ratio (STEの正答率)
+        metric = self.quantizer.codebooks[0].distance_metric
+        # 🚀 正規化済みの cb_weights_norm を使って距離を計算する
+        distances = compute_distance(encoded, cb_weights_norm, metric=metric).squeeze(1)
+        hard_indices = torch.argmin(distances, dim=-1)
+        
+        if quantizer_output.indices.dim() == 2:
+            sampled_indices_L1 = quantizer_output.indices[:, 0]
+        else:
+            sampled_indices_L1 = quantizer_output.indices
+            
+        match_ratio_L1 = (hard_indices == sampled_indices_L1).float().mean()
+
+        debug_metrics = {
+            "debug/z_variance": z_var,
+            "debug/zq_cos_sim": zq_cos_sim,
+            "debug/cb_var_L1": cb_var_L1,
+            "debug/gumbel_match_ratio_L1": match_ratio_L1
+        }
+        
+        return debug_metrics
 
     @torch.no_grad()    
     def init_codebooks(self, data: torch.Tensor):
@@ -280,6 +436,7 @@ class RQVAE(nn.Module):
         for i in range(0, data.size(0), batch_size):
             batch_data = data[i:i+batch_size]
             encoded = self.encoder(batch_data)
+            encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
             features.append(encoded)
         features = torch.cat(features, dim=0)
         self.quantizer.init_codebooks(features)

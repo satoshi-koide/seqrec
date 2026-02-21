@@ -40,7 +40,7 @@ class MLP(nn.Module):
                 self.mlp.append(nn.SiLU())
                 if dropout != 0:
                     self.mlp.append(nn.Dropout(dropout))
-        self.mlp.append(L2NormalizationLayer() if normalize else nn.Identity())
+        # self.mlp.append(L2NormalizationLayer() if normalize else nn.Identity())
 
     def forward(self, x: Tensor) -> Tensor:
         assert x.shape[-1] == self.input_dim, f"Invalid input dim: Expected {self.input_dim}, found {x.shape[-1]}"
