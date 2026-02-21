@@ -54,6 +54,45 @@ class GumbelTemperatureCallback(TrainerCallback):
             unwrapped_model = model.module if hasattr(model, "module") else model
             logs["gumbel_tau"] = unwrapped_model.tau
 
+class BetaSchedulerCallback(TrainerCallback):
+    def __init__(self, beta_init=0.0, beta_max=0.25, start=0.3):
+        """
+        decay_ratio: 全学習ステップの何%で beta_max に到達させるか（デフォルト70%）
+        """
+        self.beta_init = beta_init
+        self.beta_max = beta_max
+        self.start = start
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        total_steps = state.max_steps
+        self.target_step = int(total_steps * self.start)
+        
+        if self.target_step > 0:
+            # beta_max = beta_init * (diff ^ target_step) を diff について解く
+            self.diff = (self.beta_max - self.beta_init) / self.target_step
+        else:
+            self.diff = 0.0
+            
+        print(f"[Callback] Gumbel Softmax scheduler initialized. Target step: {self.target_step}, Diff: {self.diff:.6f}")
+    def on_step_begin(self, args, state, control, model, **kwargs):
+        if self.diff is None:
+            return
+            
+        if state.global_step < self.target_step:
+            current_beta = self.beta_init + self.diff * state.global_step
+            current_beta = min(self.beta_max, current_beta)
+            
+            # モデルの属性を直接書き換える
+            # (DataParallelやDDP環境でラップされている場合を考慮して model.module をチェック)
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            unwrapped_model.set_beta(current_beta)
+
+    # (オプション) Wandb等を使っている場合、ログ記録のタイミングで温度も出力すると分析に便利です
+    def on_log(self, args, state, control, model, logs=None, **kwargs):
+        if logs is not None:
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            logs["commitment/beta"] = unwrapped_model.beta
+
 @dataclass
 class QuantizerOutput:
     quantized: torch.Tensor
@@ -110,6 +149,9 @@ class Quantizer(nn.Module):
         self.distance_metric = distance_metric
         self.spherical_norm = spherical_norm
         self.register_buffer('initialized', torch.tensor(0))
+        # 🚀 連続未使用カウント用のバッファを追加
+        self.register_buffer('unused_count', torch.zeros(code_size))
+        self.dead_threshold = 50 # 50バッチ連続で使われなかったら復活させる
 
     def init_codebooks(self, data: torch.Tensor, prev_q: Optional[torch.Tensor] = None):
         if self.initialized: return
@@ -118,29 +160,55 @@ class Quantizer(nn.Module):
             self.initialized.fill_(1)
 
     def forward(self, x: torch.Tensor, prev_q: Optional[torch.Tensor] = None, temperature: float = 1.0) -> QuantizerOutput:
-        # 指定された Metric で距離を計算し、Gumbel用にスケールを調整
         if self.spherical_norm:
             x = F.normalize(x, p=2, dim=-1)
-            codes_norm = F.normalize(self.codes, p=2, dim=-1)
-            raw_distances = compute_distance(x, codes_norm, metric=self.distance_metric)
+            active_codes = F.normalize(self.codes, p=2, dim=-1)
         else:
-            raw_distances = compute_distance(x, self.codes, metric=self.distance_metric)
-        #distances = raw_distances / x.size(1) / self.alpha # これはダメ。かなり一様ランダムになってしまう。
-        distances = raw_distances
+            active_codes = self.codes
+
+        # 指定された Metric で距離を計算
+        distances = compute_distance(x, active_codes, metric=self.distance_metric)
 
         if self.training:
             if self.forward_mode == 'gumbel':
                 weights = F.gumbel_softmax(-distances, tau=temperature, hard=True, dim=-1)
-                quantized = torch.einsum('bc,bcd->bd', weights, self.codes)
+                quantized = torch.einsum('bc,bcd->bd', weights, active_codes)
                 quantized_out = quantized
                 indices = torch.argmax(weights, dim=-1)
             else:  # STE
                 indices = torch.argmin(distances, dim=-1)
-                quantized = self.codes[0, indices, :]
+
+                # ==== 🚀 死んだコードの復活戦略 (Patience付き) ====
+                usage = torch.bincount(indices, minlength=self.codes.size(1))
+                
+                # 使われたコードはカウントリセット、使われなかったコードはカウントアップ
+                self.unused_count[usage > 0] = 0
+                self.unused_count[usage == 0] += 1
+                
+                # 閾値を超えた「真の死んだコード」だけを取得
+                dead_indices = (self.unused_count >= self.dead_threshold).nonzero(as_tuple=True)[0]
+
+                if len(dead_indices) > 0:
+                    rand_idx = torch.randint(0, x.size(0), (len(dead_indices),), device=x.device)
+                    self.codes.data[0, dead_indices, :] = x[rand_idx].detach()
+                    
+                    # 復活させたコードのカウンターをリセット
+                    self.unused_count[dead_indices] = 0
+
+                    if self.spherical_norm:
+                        active_codes = F.normalize(self.codes, p=2, dim=-1)
+                    else:
+                        active_codes = self.codes
+                        
+                    distances = compute_distance(x, active_codes, metric=self.distance_metric)
+                    indices = torch.argmin(distances, dim=-1)
+                # ========================================================
+
+                quantized = active_codes[0, indices, :]
                 quantized_out = x + (quantized - x).detach() # STE trick
         else:
             indices = torch.argmin(distances, dim=-1)
-            quantized = self.codes[0, indices, :]
+            quantized = active_codes[0, indices, :]
             quantized_out = quantized
 
         # Loss 計算 (unsqueeze(1) を使うことで codes=(B,1,D) として compute_distance に流し込む)
@@ -315,6 +383,7 @@ class RQVAE(nn.Module):
         super().__init__()
         
         self.tau = 0.1
+        self.beta = beta
         self.is_warmup = False
         self.forward_mode = forward_mode
 
@@ -339,6 +408,11 @@ class RQVAE(nn.Module):
         else:
             print("[Mode] Switched to Full RQ-VAE mode. Quantization is active.")
 
+    def set_beta(self, beta: float):
+        self.beta = beta
+        for codebook in self.quantizer.codebooks:
+            codebook.beta = beta
+
     def forward(
         self, 
         features: torch.Tensor, 
@@ -359,10 +433,10 @@ class RQVAE(nn.Module):
                 reconstructed = F.normalize(reconstructed, p=2, dim=-1) # ここも正規化するなら、features と同様に正規化する必要があります。
             recon_loss = torch.mean(torch.sum((features - reconstructed) ** 2, dim=-1))
 
-            with torch.no_grad():
-                features_norm = torch.norm(features, dim=-1).mean().item()
-                recon_norm = torch.norm(reconstructed, dim=-1).mean().item()
-                print(f"[Debug] Warm-up mode: recon_loss={recon_loss.item():.4f}, features_norm={features_norm:.4f}, recon_norm={recon_norm:.4f}")
+            #with torch.no_grad():
+                #features_norm = torc#h.norm(features, dim=-1).mean().item()
+                #recon_norm = torch.norm(reconstructed, dim=-1).mean().item()
+                #print(f"[Debug] Warm-up mode: recon_loss={recon_loss.item():.4f}, features_norm={features_norm:.4f}, recon_norm={recon_norm:.4f}")
             
             return RQVAEOutput(
                 loss=recon_loss, 
@@ -397,8 +471,10 @@ class RQVAE(nn.Module):
     def compute_debug_metrics(self, encoded: torch.Tensor, quantizer_output: QuantizerOutput) -> Dict[str, float]:
         z_var = torch.var(encoded, dim=0).mean()
 
+        encoded_norm = torch.norm(encoded, dim=-1)
+
         q_norm = torch.nn.functional.normalize(quantizer_output.quantized, p=2, dim=-1)
-        zq_cos_sim = torch.mean(torch.sum(encoded * q_norm, dim=-1))
+        zq_cos_sim = torch.mean(torch.sum(F.normalize(encoded, p=2, dim=-1) * q_norm, dim=-1))
 
         # === 🚀 修正: 生の重みを取得し、必ず F.normalize をかける！ ===
         cb_weights_raw = self.quantizer.codebooks[0].codes if hasattr(self.quantizer.codebooks[0], 'codes') else self.quantizer.codebooks[0].weight
@@ -410,7 +486,7 @@ class RQVAE(nn.Module):
         # 2. Gumbel Match Ratio (STEの正答率)
         metric = self.quantizer.codebooks[0].distance_metric
         # 🚀 正規化済みの cb_weights_norm を使って距離を計算する
-        distances = compute_distance(encoded, cb_weights_norm, metric=metric).squeeze(1)
+        distances = compute_distance(F.normalize(encoded, p=2, dim=-1), cb_weights_norm, metric=metric).squeeze(1)
         hard_indices = torch.argmin(distances, dim=-1)
         
         if quantizer_output.indices.dim() == 2:
@@ -421,6 +497,7 @@ class RQVAE(nn.Module):
         match_ratio_L1 = (hard_indices == sampled_indices_L1).float().mean()
 
         debug_metrics = {
+            "debug/encoded_norm": encoded_norm.mean(),
             "debug/z_variance": z_var,
             "debug/zq_cos_sim": zq_cos_sim,
             "debug/cb_var_L1": cb_var_L1,

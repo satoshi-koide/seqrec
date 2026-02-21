@@ -3,11 +3,12 @@ import numpy as np
 import torch
 import gzip
 from typing import Dict
+import os
 
 from transformers import Trainer, TrainingArguments
 from seqrec.dataset import Item, ItemDataset, ItemDatasetCollator
 #from seqrec.module.rqvae import RQVAE
-from seqrec.module.rotational_rqvae import RQVAE, GumbelTemperatureCallback
+from seqrec.module.rotational_rqvae import RQVAE, GumbelTemperatureCallback, BetaSchedulerCallback
 from seqrec.module.feature_extractor import CachedItemFeatureStore
 
 def load_data(dataset_path: str, data_size=20000):
@@ -172,6 +173,8 @@ def inspect_codebook_scales(model):
 #     return optimizer
 
 def main(dataset_path: str):
+    os.environ["WANDB_PROJECT"] = "RQ-VAE"
+
     # Settings
     device = 'cuda'
     model_names = {
@@ -189,8 +192,8 @@ def main(dataset_path: str):
         for k, v in example_features.items():
             print(f"  {k} features shape: {v.shape}, norm: {torch.norm(v[0]).item():.4f}")
 
-    #forward_mode = 'STE' # or 'gumbel'
-    forward_mode = 'gumbel'
+    forward_mode = 'STE' # or 'gumbel'
+    #forward_mode = 'gumbel'
 
     item_dataset = ItemDataset({item.item_id: item for item in load_data(dataset_path, data_size=None)})
     print(f"Loaded {len(item_dataset)} items.")
@@ -205,13 +208,13 @@ def main(dataset_path: str):
     rqvae.set_warmup_mode(True)
 
     # Warm-up用のTrainer設定（エポック数は5〜10程度で十分です）
-    warmup_batch_size = 1024
+    warmup_batch_size = 2048
     warmup_args = TrainingArguments(
-        learning_rate=1e-5 * warmup_batch_size / 128, 
+        learning_rate=1e-4 * warmup_batch_size / 128, 
         weight_decay=0.0,
-        num_train_epochs=5, 
+        num_train_epochs=20, 
         per_device_train_batch_size=warmup_batch_size,
-        logging_steps=100, 
+        logging_steps=100,
         output_dir="./output_rqvae_warmup", 
         save_strategy="no")
     warmup_trainer = RQVAETrainer(model=rqvae, args=warmup_args, train_dataset=item_dataset, data_collator=collate_fn)
@@ -241,7 +244,7 @@ def main(dataset_path: str):
     for param in rqvae.quantizer.parameters():
         param.requires_grad = True
 
-    batch_size = 1024
+    batch_size = 2048
     # lr = 1e-5 * batch_size / 128
     # weight_decay=0.01
     # optimizer = create_optimizer(rqvae, lr=lr, weight_decay=weight_decay) # Encoder / Decoder は lr=0 で凍結、Quantizer のみ学習
@@ -273,15 +276,72 @@ def main(dataset_path: str):
         print('[Info] Using Straight-Through Estimator (STE) for quantization during training.')
         callbacks = []
 
+    # Commitment loss の重みを徐々に増やすスケジューラーも追加
+    callbacks.append(BetaSchedulerCallback(beta_init=0.0, beta_max=0.25, start=0.3))
+
     trainer = RQVAETrainer(
         model=rqvae,
         args=training_args,
         train_dataset=item_dataset,
         data_collator=collate_fn,
         #optimizers = (optimizer, None), # カスタムオプティマイザを直接渡す
-        callbacks=callbacks
+        callbacks=callbacks,
     )
     trainer.train()
+
+
+    # 3. 全体の微調整フェーズ（Encoder / Decoder の凍結を解除して全体を微調整）
+    for param in rqvae.parameters():
+        param.requires_grad = True
+
+    if forward_mode == 'gumbel':
+        print('[Info] Using Gumbel-Softmax relaxation for quantization during training.')
+        callbacks = [GumbelTemperatureCallback(tau_init=0.1, tau_min=0.001, decay_ratio=0.7)]
+    elif forward_mode == 'STE':
+        print('[Info] Using Straight-Through Estimator (STE) for quantization during training.')
+        callbacks = []
+
+    # Commitment loss の重みを徐々に増やすスケジューラーも追加
+    callbacks.append(BetaSchedulerCallback(beta_init=0.0, beta_max=0.25, start=0.3))
+
+    batch_size = 2048
+    training_args = TrainingArguments(
+        output_dir="./output_rqvae_phase2",
+        
+        # 学習設定
+        num_train_epochs=2000,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=128, # 注意: メモリ圧迫する場合は下げる
+        learning_rate=1e-5 * batch_size / 128, # バッチサイズに応じた学習率スケーリング
+        weight_decay=0.0,
+        warmup_ratio=0.1,
+        max_grad_norm=1.0,
+        
+        # 高速化・ログ
+        #fp16=torch.cuda.is_available(), # GPUがあればFP16有効化
+        bf16=torch.cuda.is_available(), # GPUがあればBF16有効化
+        logging_dir='./logs',
+        logging_steps=100,
+        dataloader_num_workers=0, # データローダーの並列数
+        report_to="wandb",
+    )
+
+    trainer = RQVAETrainer(
+        model=rqvae,
+        args=training_args,
+        train_dataset=item_dataset,
+        data_collator=collate_fn,
+        #optimizers = (optimizer, None), # カスタムオプティマイザを直接渡す
+        callbacks=callbacks,
+    )
+    trainer.train()
+
+    # Save model
+    category = dataset_path.split("/")[-1]
+    torch.save(rqvae.state_dict(), f"./rqvae_final_{category}_{forward_mode}.pth")
+
+     # 学習後のコードブックのスケールを再度確認
+
 
 if __name__ == "__main__":
     main("dataset/toys")
