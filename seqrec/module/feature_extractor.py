@@ -194,10 +194,11 @@ class AbstractItemFeatureExtractor(nn.Module, abc.ABC):
             )
 
 class TextFeatureExtractor(AbstractItemFeatureExtractor):
-    def __init__(self, encoder: AbstractTextEncoder, feature_key: str = "text_features"):
+    def __init__(self, encoder: AbstractTextEncoder, feature_key: str = "text_features", verbose: bool = False):
         super().__init__()
         self.encoder = encoder
         self.feature_key = feature_key
+        self.verbose = verbose
 
     def feature_dims(self) -> Dict[str, int]:
         return {self.feature_key: self.encoder.get_output_dim()}
@@ -209,10 +210,11 @@ class TextFeatureExtractor(AbstractItemFeatureExtractor):
 
 
 class ImageFeatureExtractor(AbstractItemFeatureExtractor):
-    def __init__(self, encoder: AbstractImageEncoder, feature_key: str = "image_features"):
+    def __init__(self, encoder: AbstractImageEncoder, feature_key: str = "image_features", verbose: bool = False):
         super().__init__()
         self.encoder = encoder
         self.feature_key = feature_key
+        self.verbose = verbose
 
     def _load_images(self, paths: List[Optional[str]]) -> List[Optional[Image.Image]]:
         images = []
@@ -222,6 +224,8 @@ class ImageFeatureExtractor(AbstractItemFeatureExtractor):
                     images.append(Image.open(p).convert("RGB"))
                     continue
                 except Exception:
+                    if self.verbose:
+                        print(f"Warning: Failed to load image at {p}. Using fallback.")
                     pass
             images.append(None)
         return images
@@ -273,12 +277,13 @@ class CachedItemFeatureStore(AbstractItemFeatureStore):
     抽出済みのキャッシュ(.npzファイル)から特徴量をロードして返すためのストア。
     初期化時にファイルを読み込み、メモリ上に保持する。
     """
-    def __init__(self, npz_paths: Dict[str, str]):
+    def __init__(self, npz_paths: Dict[str, str], normalize: bool = True):
         '''
         npz_paths: 特徴量の名前をキー、対応する.npzファイルのパスを値とする辞書。E.g., {"text_features": "path/to/text_features.npz", "image_features": "path/to/image_features.npz"}
         '''
         super().__init__()
         self.feature_cache = {}
+        self.normalize = normalize
         self.feature_dimensions = {}
         
         for key, path in npz_paths.items():
@@ -297,6 +302,8 @@ class CachedItemFeatureStore(AbstractItemFeatureStore):
                 if item_id not in self.feature_cache:
                     self.feature_cache[item_id] = {}
                 self.feature_cache[item_id][key] = torch.tensor(feat)
+                if self.normalize:
+                    self.feature_cache[item_id][key] = self.feature_cache[item_id][key] / (self.feature_cache[item_id][key].norm() + 1e-8)
                 
         self.fallbacks = {
             key: torch.zeros(dim) for key, dim in self.feature_dimensions.items()
@@ -361,7 +368,8 @@ class TrainableItemFeatureStore(AbstractItemFeatureStore):
 def initialize_feature_extractor(
     text_model_name: Optional[str] = None, 
     image_model_name: Optional[str] = None,
-    device: Optional[torch.device] = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device: Optional[torch.device] = 'cuda' if torch.cuda.is_available() else 'cpu',
+    verbose: bool = False
 ) -> AbstractItemFeatureExtractor:
     """
     指定されたモデル名に基づいてエンコーダと抽出器を動的に構築するヘルパー。
@@ -383,13 +391,13 @@ def initialize_feature_extractor(
         if text_model_name not in text_model_name_to_extractor:
             raise ValueError(f"Unsupported text model: {text_model_name}")
         text_encoder = text_model_name_to_extractor[text_model_name](model_name=text_model_name)
-        extractors["text"] = TextFeatureExtractor(text_encoder, feature_key="text_features")
+        extractors["text"] = TextFeatureExtractor(text_encoder, feature_key="text_features", verbose=verbose)
         
     if image_model_name:
         if image_model_name not in image_model_name_to_extractor:
             raise ValueError(f"Unsupported image model: {image_model_name}")
         image_encoder = image_model_name_to_extractor[image_model_name](model_name=image_model_name)
-        extractors["image"] = ImageFeatureExtractor(image_encoder, feature_key="image_features")
+        extractors["image"] = ImageFeatureExtractor(image_encoder, feature_key="image_features", verbose=verbose)
         
     if not extractors:
         raise ValueError("At least one of text_model_name or image_model_name must be specified.")

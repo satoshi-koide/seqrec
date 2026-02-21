@@ -22,7 +22,7 @@ def load_data(dataset_path: str, data_size=None):
             price=item_info.get('price', None),
             brand=item_info.get('brand', None),
             categories=categories,
-            image_path=item_info.get('image_path', None)
+            image_path=f'{dataset_path}/images/{item_info["asin"]}.jpg'
         )
 
 def extract(dataset_path: str, mode: str, model_name: str):
@@ -34,11 +34,11 @@ def extract(dataset_path: str, mode: str, model_name: str):
     output_path = {}
     if mode == 'image':
         print(f"Loaded {len(item_dataset)} items.")
-        feature_extractor = initialize_feature_extractor(image_model_name=model_name, device=device)
+        feature_extractor = initialize_feature_extractor(image_model_name=model_name, device=device, verbose=True)
         output_path['image_features'] = f'{dataset_path}/feature_cache_image_{model_name.replace("/", "_")}'
     elif mode == 'text':
         print(f"Loaded {len(item_dataset)} items.")
-        feature_extractor = initialize_feature_extractor(text_model_name=model_name, device=device) 
+        feature_extractor = initialize_feature_extractor(text_model_name=model_name, device=device, verbose=True) 
         output_path['text_features'] = f'{dataset_path}/feature_cache_text_{model_name.replace("/", "_")}'
     else:
         raise ValueError(f"Unsupported mode: {mode}")
